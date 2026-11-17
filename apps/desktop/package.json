@@ -1,0 +1,64 @@
+{
+  "name": "valorant-montage-studio",
+  "version": "0.1.0",
+  "author": "VALORANT Montage Studio contributors",
+  "private": true,
+  "description": "Local-first VALORANT montage editor with optional ChatGPT subscription planning",
+  "type": "module",
+  "main": "dist-electron/main/index.js",
+  "engines": { "node": ">=22.12.0" },
+  "workspaces": [
+    "vendor/siwc-devkit/packages/local",
+    "vendor/siwc-devkit/packages/react"
+  ],
+  "scripts": {
+    "build:siwc": "npm run build --workspace=@siwc/local && npm run build --workspace=@siwc/react",
+    "dev": "npm run build:siwc && electron-vite dev",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run build:siwc && npm run typecheck && electron-vite build",
+    "preview": "electron-vite preview",
+    "test": "vitest run shared/director.test.ts",
+    "package:win": "npm run build && electron-builder --win nsis"
+  },
+  "dependencies": {
+    "@siwc/local": "0.1.0",
+    "@siwc/react": "0.1.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "^42.11.4",
+    "electron-builder": "^26.10.0",
+    "electron-vite": "^5.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^7.0.0",
+    "vitest": "^4.0.0"
+  },
+  "build": {
+    "appId": "local.valorant-montage-studio",
+    "productName": "VALORANT Montage Studio",
+    "directories": {"output": "release"},
+    "files": ["dist-electron/**/*", "package.json"],
+    "extraResources": [
+      {"from": "../../services", "to": "worker/services"},
+      {"from": "../../LICENSE", "to": "LICENSE"},
+      {"from": "../../THIRD_PARTY_NOTICES.md", "to": "THIRD_PARTY_NOTICES.md"},
+      {"from": "vendor/siwc-devkit/LICENSE", "to": "licenses/SIWC-DEVKIT-LICENSE.txt"},
+      {"from": "vendor/siwc-devkit/THIRD_PARTY_NOTICES.md", "to": "licenses/SIWC-THIRD-PARTY-NOTICES.md"}
+    ],
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "VALORANT-Montage-Studio-${version}-Windows-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}

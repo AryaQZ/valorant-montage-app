@@ -1,0 +1,10 @@
+node_modules/
+__pycache__/
+*.py[cod]
+.build-tools/
+apps/desktop/dist-electron/
+apps/desktop/release/
+apps/desktop/vendor/siwc-devkit/packages/*/dist/
+apps/desktop/vendor/siwc-devkit/examples/*/dist/
+*.partial.mp4
+*.tmp

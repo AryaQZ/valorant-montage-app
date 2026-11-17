@@ -1,0 +1,13 @@
+[project]
+name = "valorant-montage-studio"
+version = "0.1.0"
+description = "Local-first Windows montage editor for recorded VALORANT gameplay"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.unittest]
+start-directory = "tests"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
