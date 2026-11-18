@@ -1,0 +1,6 @@
+[submodule "third_party/editing-gameplay-montages"]
+	path = third_party/editing-gameplay-montages
+	url = https://github.com/gustavomenani/editing-gameplay-montages.git
+[submodule "apps/desktop/vendor/siwc-devkit"]
+	path = apps/desktop/vendor/siwc-devkit
+	url = https://github.com/openai/sign-in-with-chatgpt-devkit.git
