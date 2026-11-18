@@ -1,4 +1,7 @@
-# VALORANT Montage Studio
+# valorant-montage-app
+AI Editing for Valorant
+
+## VALORANT Montage Studio
 
 VALORANT Montage Studio is a local-first Windows desktop editor for turning recorded gameplay into a reviewable montage. Its working baseline supports manual highlight annotation, a non-destructive clip timeline, local music analysis, rule-only and optional ChatGPT subscription edit suggestions, autosave, export, and post-render QA. **Kill detection is a manual baseline; the app does not claim automatic kill detection.**
 
