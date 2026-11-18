@@ -44,7 +44,30 @@ class ProjectSchemaTests(unittest.TestCase):
         self.assertEqual(clip["output_start_frame"], 0)
         self.assertEqual(clip["time_remap"][0]["speed_num"], 1)
         self.assertEqual(clip["effects"][0]["type"], "impact_zoom")
+        self.assertEqual(clip["included_event_ids"], ["event-1"])
+        self.assertGreaterEqual(clip["effects"][0]["max_zoom"], 1.03)
         validate_project(project, require_timeline=True)
+
+    def test_timeline_keeps_each_reviewed_impact_in_a_grouped_sequence(self) -> None:
+        project = sample_project()
+        second = deepcopy(project["events"][0])
+        second.update({"event_id": "event-2", "source_time_us": 2_300_000,
+                       "source_frame": 138, "in_us": 1_300_000, "out_us": 2_800_000})
+        project["events"].append(second)
+        clip = add_timeline_clip(project, "event-1")
+        clip["included_event_ids"] = ["event-1", "event-2"]
+        validate_project(project, require_timeline=True)
+        self.assertEqual(clip["included_event_ids"], ["event-1", "event-2"])
+        clip["included_event_ids"].append("unknown-event")
+        with self.assertRaisesRegex(ProjectValidationError, "included event yang tidak dikenal"):
+            validate_project(project)
+
+    def test_legacy_v2_timeline_defaults_included_events_to_primary_event(self) -> None:
+        project = sample_project()
+        clip = add_timeline_clip(project, "event-1")
+        del clip["included_event_ids"]
+        validate_project(project)
+        self.assertEqual(clip["included_event_ids"], ["event-1"])
 
     def test_reordered_clips_recalculate_integer_frame_offsets(self) -> None:
         project = sample_project()
@@ -88,6 +111,29 @@ class ProjectSchemaTests(unittest.TestCase):
         clip["effects"] = []
         clip["time_remap"][0]["speed_num"] = 5
         with self.assertRaisesRegex(ProjectValidationError, "Speed remap"):
+            validate_project(project)
+
+    def test_v1_project_migrates_to_v2_and_repairs_legacy_zoom_anchor(self) -> None:
+        project = sample_project()
+        clip = add_timeline_clip(project, "event-1")
+        project["schema_version"] = 1
+        del clip["included_event_ids"]
+        clip["effects"][0]["anchor"] = "center"
+        migrated = validate_project(project)
+        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["timeline"][0]["effects"][0]["anchor"], "impact")
+        self.assertEqual(migrated["timeline"][0]["included_event_ids"], ["event-1"])
+
+    def test_zoom_keyframes_are_ordered_and_include_the_impact_anchor(self) -> None:
+        project = sample_project()
+        clip = add_timeline_clip(project, "event-1")
+        zoom = clip["effects"][0]
+        self.assertEqual(zoom["keyframes"][1], {"frame_offset": 0, "scale": zoom["max_zoom"]})
+        zoom["keyframes"] = [
+            {"frame_offset": 0, "scale": zoom["max_zoom"]},
+            {"frame_offset": -12, "scale": 1.0},
+        ]
+        with self.assertRaisesRegex(ProjectValidationError, "harus terurut"):
             validate_project(project)
 
     def test_save_load_round_trip_is_versioned_json(self) -> None:

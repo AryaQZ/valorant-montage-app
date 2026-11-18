@@ -25,10 +25,11 @@ The worker uses Python's standard library; no third-party Python packages are re
 
 ## Project model and timeline
 
-`packages/project-schema/schema-v1.json` describes the portable project format. Python validation checks cross-object constraints that JSON Schema cannot express:
+`packages/project-schema/schema-v2.json` describes the current portable project format; `schema-v1.json` is retained for legacy imports. Python validation checks cross-object constraints that JSON Schema cannot express:
 
 - integer microsecond timestamps and source/event IDs;
 - impact points within event ranges and clip trims within their event/source;
+- grouped timeline clips retain every reviewed event impact in `included_event_ids`; legacy v2 clips normalize to their primary event;
 - consecutive integer output frames at exactly 144 or 60 FPS;
 - time-remap segments covering the clip with bounded speed ratios;
 - allowlisted effects and numeric limits.

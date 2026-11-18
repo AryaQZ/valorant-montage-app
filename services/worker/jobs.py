@@ -62,6 +62,7 @@ class JobManager:
                                     rights_acknowledged=bool(body.get("rights_acknowledged")),
                                     ownership_acknowledged=bool(body.get("ownership_acknowledged")),
                                     cancel_event=signal,
+                                    render_mode=str(body.get("render_mode", "master")),
                                     progress=lambda value, message: self._update(job_id, progress=value,
                                                                                  message=message))
             self._update(job_id, status="complete" if result["state"] == "complete" else "needs_review",

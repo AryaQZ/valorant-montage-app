@@ -17,7 +17,7 @@
     "typecheck": "tsc --noEmit",
     "build": "npm run build:siwc && npm run typecheck && electron-vite build",
     "preview": "electron-vite preview",
-    "test": "vitest run shared/director.test.ts",
+    "test": "vitest run shared/director.test.ts electron/worker-client.test.ts",
     "package:win": "npm run build && electron-builder --win nsis"
   },
   "dependencies": {
@@ -45,8 +45,10 @@
     "files": ["dist-electron/**/*", "package.json"],
     "extraResources": [
       {"from": "../../services", "to": "worker/services"},
+      {"from": "../../third_party/editing-gameplay-montages/skills/editing-gameplay-montages", "to": "upstream/editing-gameplay-montages"},
       {"from": "../../LICENSE", "to": "LICENSE"},
       {"from": "../../THIRD_PARTY_NOTICES.md", "to": "THIRD_PARTY_NOTICES.md"},
+      {"from": "../../third_party/editing-gameplay-montages/LICENSE", "to": "licenses/editing-gameplay-montages-LICENSE.txt"},
       {"from": "vendor/siwc-devkit/LICENSE", "to": "licenses/SIWC-DEVKIT-LICENSE.txt"},
       {"from": "vendor/siwc-devkit/THIRD_PARTY_NOTICES.md", "to": "licenses/SIWC-THIRD-PARTY-NOTICES.md"}
     ],

@@ -12,8 +12,10 @@ import re
 import tempfile
 import uuid
 
-SCHEMA_VERSION = 1
-PROFILES = {"master_144": 144, "youtube_60": 60}
+SCHEMA_VERSION = 2
+PROFILES = {"master_144": 144, "youtube_60": 60, "preview_30": 30}
+PROFILE_DIMENSIONS = {"master_144": (2560, 1440), "youtube_60": (2560, 1440), "preview_30": (1280, 720)}
+EFFECT_TYPES = {"impact_zoom", "motion_blur", "screen_shake", "impact_flash"}
 
 
 class ProjectValidationError(ValueError):
@@ -62,7 +64,50 @@ def _require_int(value: Any, field: str, minimum: int = 0) -> int:
     return value
 
 
+def _upgrade_project(project: dict[str, Any]) -> dict[str, Any]:
+    """Migrate the original v1 contract in memory before validating imported projects."""
+    if not isinstance(project, dict):
+        raise ProjectValidationError("Project harus berupa object JSON.")
+    if project.get("schema_version") == SCHEMA_VERSION:
+        return project
+    if project.get("schema_version") != 1:
+        raise ProjectValidationError(f"Versi project tidak didukung: {project.get('schema_version')!r}.")
+    import copy
+    migrated = copy.deepcopy(project)
+    migrated["schema_version"] = SCHEMA_VERSION
+    settings = migrated.setdefault("settings", {})
+    settings.setdefault("style", "smooth_clean")
+    settings.setdefault("beat_sync_priority", 0.75)
+    settings.setdefault("effects_intensity", 0.45)
+    settings.setdefault("output_profile", "master_144")
+    settings.setdefault("music_gain", 0.18)
+    settings.setdefault("gameplay_gain", 1.0)
+    for clip in migrated.get("timeline", []):
+        if not isinstance(clip, dict):
+            continue
+        fps = PROFILES.get(settings.get("output_profile"), 144)
+        frames = clip.get("duration_frames")
+        if type(frames) is not int:
+            frames = duration_to_frames(max(1, int(clip.get("out_us", 1)) - int(clip.get("in_us", 0))), fps)
+            clip["duration_frames"] = frames
+        if not clip.get("time_remap"):
+            clip["time_remap"] = [{"output_start_frame": 0, "output_end_frame": frames,
+                                    "source_start_us": clip.get("in_us", 0), "source_end_us": clip.get("out_us", 1),
+                                    "speed_num": 1, "speed_den": 1, "direction": "forward"}]
+        else:
+            for segment in clip["time_remap"]:
+                if isinstance(segment, dict):
+                    segment.setdefault("direction", "forward")
+        for effect in clip.get("effects", []):
+            if isinstance(effect, dict) and effect.get("type") == "impact_zoom" and effect.get("anchor") == "center":
+                effect["anchor"] = "impact"
+        clip.setdefault("transitions", [])
+        clip.setdefault("included_event_ids", [clip.get("event_id")])
+    return migrated
+
+
 def validate_project(project: dict[str, Any], *, require_timeline: bool = False) -> dict[str, Any]:
+    project = _upgrade_project(project)
     if not isinstance(project, dict):
         raise ProjectValidationError("Project harus berupa object JSON.")
     if project.get("schema_version") != SCHEMA_VERSION:
@@ -154,21 +199,86 @@ def validate_project(project: dict[str, Any], *, require_timeline: bool = False)
             raise ProjectValidationError(f"Trim clip {clip_id} berada di luar event yang dipilih.")
         if source.get("duration_us") is not None and end_us > source["duration_us"]:
             raise ProjectValidationError(f"Trim clip {clip_id} melewati source.")
-        duration_frames = duration_to_frames(end_us - start_us, fps)
-        if clip.get("duration_frames") != duration_frames:
-            raise ProjectValidationError(f"Jumlah frame clip {clip_id} tidak cocok dengan trim dan profile.")
+        included_event_ids = clip.setdefault("included_event_ids", [event["event_id"]])
+        if (not isinstance(included_event_ids, list) or not included_event_ids
+                or any(not isinstance(item, str) for item in included_event_ids)
+                or len(set(included_event_ids)) != len(included_event_ids)
+                or event["event_id"] not in included_event_ids):
+            raise ProjectValidationError(f"included_event_ids pada clip {clip_id} tidak valid.")
+        for included_event_id in included_event_ids:
+            included = event_by_id.get(included_event_id)
+            if included is None:
+                raise ProjectValidationError(f"Clip {clip_id} merujuk ke included event yang tidak dikenal.")
+            if included["source_media_id"] != clip["source_media_id"]:
+                raise ProjectValidationError(f"Included event {included_event_id} berasal dari source berbeda.")
+            if not start_us <= included["source_time_us"] <= end_us:
+                raise ProjectValidationError(f"Impact included event {included_event_id} tidak terlihat dalam clip {clip_id}.")
         if clip.get("output_start_frame") != running_frames:
             raise ProjectValidationError("Clip harus berurutan dan tidak saling tumpang tindih.")
         effects = clip.get("effects", [])
         if not isinstance(effects, list):
             raise ProjectValidationError(f"effects pada clip {clip_id} harus array.")
         for effect in effects:
-            if not isinstance(effect, dict) or effect.get("type") not in {"impact_zoom"}:
+            if not isinstance(effect, dict) or effect.get("type") not in EFFECT_TYPES:
                 raise ProjectValidationError(f"Jenis effect pada clip {clip_id} tidak didukung.")
-            max_zoom = effect.get("max_zoom")
-            if not isinstance(max_zoom, (int, float)) or not 1 <= max_zoom <= 1.04:
-                raise ProjectValidationError(f"Parameter impact_zoom clip {clip_id} di luar batas.")
-        _validate_speed_segments(clip, duration_frames, start_us, end_us)
+            kind = effect["type"]
+            if kind == "impact_zoom":
+                value = effect.get("max_zoom")
+                if not _bounded_number(value, 1.0, 1.08):
+                    raise ProjectValidationError(f"Parameter impact_zoom clip {clip_id} di luar batas.")
+                _require_int(effect.get("duration_frames"), f"effect {kind}.duration_frames", 1)
+                if effect.get("anchor") != "impact" or not isinstance(effect.get("enabled"), bool):
+                    raise ProjectValidationError(f"Konfigurasi impact_zoom clip {clip_id} tidak valid.")
+                keyframes = effect.get("keyframes")
+                if keyframes is not None:
+                    if not isinstance(keyframes, list) or not 2 <= len(keyframes) <= 8:
+                        raise ProjectValidationError(f"Keyframe impact_zoom clip {clip_id} harus berisi 2-8 titik.")
+                    previous_offset: int | None = None
+                    has_impact_key = False
+                    for keyframe in keyframes:
+                        if not isinstance(keyframe, dict) or type(keyframe.get("frame_offset")) is not int:
+                            raise ProjectValidationError(f"Keyframe impact_zoom clip {clip_id} tidak valid.")
+                        offset = keyframe["frame_offset"]
+                        if abs(offset) > effect["duration_frames"]:
+                            raise ProjectValidationError(f"Keyframe impact_zoom clip {clip_id} melewati durasi efek.")
+                        if previous_offset is not None and offset <= previous_offset:
+                            raise ProjectValidationError(f"Keyframe impact_zoom clip {clip_id} harus terurut.")
+                        if not _bounded_number(keyframe.get("scale"), 1.0, value):
+                            raise ProjectValidationError(f"Scale keyframe impact_zoom clip {clip_id} di luar batas.")
+                        has_impact_key = has_impact_key or offset == 0
+                        previous_offset = offset
+                    if not has_impact_key:
+                        raise ProjectValidationError(f"Keyframe impact_zoom clip {clip_id} harus memiliki anchor pada impact.")
+            elif kind == "motion_blur":
+                if not _bounded_number(effect.get("strength"), 0.0, 0.65):
+                    raise ProjectValidationError(f"Parameter motion_blur clip {clip_id} di luar batas.")
+                if effect.get("window_frames") not in {3, 5} or not isinstance(effect.get("enabled"), bool):
+                    raise ProjectValidationError(f"Konfigurasi motion_blur clip {clip_id} tidak valid.")
+            elif kind == "screen_shake":
+                if not _bounded_number(effect.get("amplitude_px"), 0.0, 18.0):
+                    raise ProjectValidationError(f"Parameter screen_shake clip {clip_id} di luar batas.")
+                _require_int(effect.get("duration_frames"), f"effect {kind}.duration_frames", 1)
+                if not isinstance(effect.get("enabled"), bool):
+                    raise ProjectValidationError(f"Konfigurasi screen_shake clip {clip_id} tidak valid.")
+            elif kind == "impact_flash":
+                if not _bounded_number(effect.get("intensity"), 0.0, 0.45):
+                    raise ProjectValidationError(f"Parameter impact_flash clip {clip_id} di luar batas.")
+                _require_int(effect.get("duration_frames"), f"effect {kind}.duration_frames", 1)
+                if not isinstance(effect.get("enabled"), bool):
+                    raise ProjectValidationError(f"Konfigurasi impact_flash clip {clip_id} tidak valid.")
+        transitions = clip.get("transitions", [])
+        if not isinstance(transitions, list):
+            raise ProjectValidationError(f"transitions pada clip {clip_id} harus array.")
+        for transition in transitions:
+            if (not isinstance(transition, dict) or transition.get("type") != "dip_to_black"
+                    or not isinstance(transition.get("enabled"), bool)):
+                raise ProjectValidationError(f"Transition pada clip {clip_id} tidak didukung.")
+            duration = _require_int(transition.get("duration_frames"), f"transition {clip_id}.duration_frames", 1)
+            if duration > 24:
+                raise ProjectValidationError(f"Transition clip {clip_id} terlalu panjang.")
+        duration_frames = _validate_speed_segments(clip, start_us, end_us)
+        if clip.get("duration_frames") != duration_frames:
+            raise ProjectValidationError(f"Jumlah frame clip {clip_id} tidak cocok dengan time_remap.")
         running_frames += duration_frames
 
     music = project.get("music")
@@ -180,10 +290,14 @@ def validate_project(project: dict[str, Any], *, require_timeline: bool = False)
     return project
 
 
-def _validate_speed_segments(clip: dict[str, Any], frames: int, start_us: int, end_us: int) -> None:
-    segments = clip.get("time_remap", [{"output_start_frame": 0, "output_end_frame": frames,
+def _bounded_number(value: Any, low: float, high: float) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and low <= value <= high
+
+
+def _validate_speed_segments(clip: dict[str, Any], start_us: int, end_us: int) -> int:
+    segments = clip.get("time_remap", [{"output_start_frame": 0, "output_end_frame": clip.get("duration_frames", 1),
                                          "source_start_us": start_us, "source_end_us": end_us,
-                                         "speed_num": 1, "speed_den": 1}])
+                                         "speed_num": 1, "speed_den": 1, "direction": "forward"}])
     if not isinstance(segments, list) or not segments:
         raise ProjectValidationError("time_remap harus memiliki setidaknya satu segmen.")
     previous_out = 0
@@ -201,9 +315,12 @@ def _validate_speed_segments(clip: dict[str, Any], frames: int, start_us: int, e
         ratio = Fraction(speed_num, speed_den)
         if ratio < Fraction(1, 4) or ratio > 4:
             raise ProjectValidationError("Speed remap harus berada antara 0.25x dan 4x.")
+        if segment.get("direction", "forward") not in {"forward", "reverse"}:
+            raise ProjectValidationError(f"time_remap[{index}].direction harus forward atau reverse.")
         previous_out = out_end
-    if previous_out != frames:
+    if previous_out != clip.get("duration_frames"):
         raise ProjectValidationError("time_remap harus menutup seluruh frame clip tanpa gap.")
+    return previous_out
 
 
 def add_timeline_clip(project: dict[str, Any], event_id: str, *, in_us: int | None = None,
@@ -220,11 +337,24 @@ def add_timeline_clip(project: dict[str, Any], event_id: str, *, in_us: int | No
     intensity = float(project["settings"].get("effects_intensity", 0.45))
     effect_list: list[dict[str, Any]] = []
     if intensity > 0:
-        effect_list.append({"type": "impact_zoom", "max_zoom": round(1 + 0.04 * intensity, 4),
-                            "duration_frames": 24, "anchor": "center", "enabled": True})
+        peak = round(min(1.08, 1 + 0.08 * intensity), 4)
+        effect_list.append({"type": "impact_zoom", "max_zoom": peak,
+                            "duration_frames": 24, "anchor": "impact", "enabled": True,
+                            "keyframes": [{"frame_offset": -12, "scale": 1.0},
+                                          {"frame_offset": 0, "scale": peak},
+                                          {"frame_offset": 12, "scale": 1.0}]})
+        if "headshot" in event.get("tags", []) or "multikill" in event.get("tags", []):
+            effect_list.append({"type": "impact_flash", "intensity": round(0.22 * intensity, 3),
+                                "duration_frames": 3, "enabled": True})
+        if "multikill" in event.get("tags", []) and event.get("confidence", 0.0) >= 0.8:
+            effect_list.append({"type": "screen_shake", "amplitude_px": round(8.0 * intensity, 2),
+                                "duration_frames": 12, "enabled": True})
+            effect_list.append({"type": "motion_blur", "strength": round(0.25 * intensity, 3),
+                                "window_frames": 3, "enabled": True})
     clip = {
         "clip_id": str(uuid.uuid4()),
         "event_id": event_id,
+        "included_event_ids": [event_id],
         "source_media_id": event["source_media_id"],
         "in_us": start_us,
         "out_us": end_us,
@@ -232,7 +362,7 @@ def add_timeline_clip(project: dict[str, Any], event_id: str, *, in_us: int | No
         "duration_frames": duration_frames,
         "time_remap": [{"output_start_frame": 0, "output_end_frame": duration_frames,
                         "source_start_us": start_us, "source_end_us": end_us,
-                        "speed_num": 1, "speed_den": 1}],
+                        "speed_num": 1, "speed_den": 1, "direction": "forward"}],
         "effects": effect_list,
         "transitions": [],
         "audio_gain": float(project["settings"].get("gameplay_gain", 1.0)),
@@ -246,17 +376,26 @@ def normalize_timeline(project: dict[str, Any]) -> None:
     fps = PROFILES[project["settings"]["output_profile"]]
     offset = 0
     for clip in project["timeline"]:
+        segments = clip.get("time_remap") or [{"source_start_us": clip["in_us"], "source_end_us": clip["out_us"],
+                                               "speed_num": 1, "speed_den": 1, "direction": "forward"}]
+        cursor = 0
+        for segment in segments:
+            segment["direction"] = segment.get("direction", "forward")
+            span = segment["source_end_us"] - segment["source_start_us"]
+            speed = Fraction(segment["speed_num"], segment["speed_den"])
+            count = duration_to_frames(round(span * speed.denominator / speed.numerator), fps)
+            segment["output_start_frame"] = cursor
+            segment["output_end_frame"] = cursor + count
+            cursor += count
         clip["output_start_frame"] = offset
-        clip["duration_frames"] = duration_to_frames(clip["out_us"] - clip["in_us"], fps)
-        clip["time_remap"] = [{"output_start_frame": 0, "output_end_frame": clip["duration_frames"],
-                               "source_start_us": clip["in_us"], "source_end_us": clip["out_us"],
-                               "speed_num": 1, "speed_den": 1}]
-        offset += clip["duration_frames"]
+        clip["duration_frames"] = cursor
+        clip["time_remap"] = segments
+        offset += cursor
     validate_project(project)
 
 
 def save_project(project: dict[str, Any], path: str | Path) -> None:
-    validate_project(project)
+    project = validate_project(project)
     destination = Path(path).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None

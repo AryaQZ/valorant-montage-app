@@ -704,7 +704,7 @@ class MontageStudioApp(tk.Tk):
         self.project["settings"]["effects_intensity"] = intensity
         for clip in self.project["timeline"]:
             clip["effects"] = ([{"type": "impact_zoom", "max_zoom": round(1 + 0.04 * intensity, 4),
-                                  "duration_frames": 24, "anchor": "center", "enabled": True}]
+                                  "duration_frames": 24, "anchor": "impact", "enabled": True}]
                                 if intensity > 0 else [])
         self._changed(f"Impact zoom intensity diset ke {intensity:.2f}.")
 

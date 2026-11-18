@@ -5,11 +5,13 @@ import type { Project } from '../shared/project.js';
 const bridge: VMSBridge = {
   getWorkerState: () => ipcRenderer.invoke('vms:worker-state'),
   importRecordings: () => ipcRenderer.invoke('vms:import-recordings'),
+  detectKills: (source) => ipcRenderer.invoke('vms:detect-kills', source),
   importMusic: () => ipcRenderer.invoke('vms:import-music'),
   saveProject: (project, currentPath) => ipcRenderer.invoke('vms:save-project', project, currentPath),
   loadProject: () => ipcRenderer.invoke('vms:load-project'),
   autosaveProject: (project) => ipcRenderer.invoke('vms:autosave-project', project),
   render: (project, acknowledgements) => ipcRenderer.invoke('vms:render', project, acknowledgements),
+  renderPreview: (project, mode, acknowledgements) => ipcRenderer.invoke('vms:render-preview', project, mode, acknowledgements),
   getRenderJob: (jobId) => ipcRenderer.invoke('vms:render-job', jobId),
   cancelRender: (jobId) => ipcRenderer.invoke('vms:cancel-render', jobId),
   revealLocalFile: (path) => ipcRenderer.invoke('vms:reveal-local-file', path),

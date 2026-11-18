@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://valorant-montage-studio.local/project-v2.schema.json",
+  "title": "VALORANT Montage Studio Project v2",
+  "type": "object",
+  "required": ["schema_version", "project_id", "name", "settings", "sources", "events", "timeline", "music"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "project_id": {"type": "string", "minLength": 8, "maxLength": 80},
+    "name": {"type": "string", "minLength": 1},
+    "created_utc": {"type": "string"},
+    "settings": {
+      "type": "object",
+      "required": ["style", "beat_sync_priority", "effects_intensity", "output_profile"],
+      "properties": {
+        "style": {"const": "smooth_clean"},
+        "beat_sync_priority": {"type": "number", "minimum": 0, "maximum": 1.5},
+        "effects_intensity": {"type": "number", "minimum": 0, "maximum": 1.5},
+        "output_profile": {"enum": ["master_144", "youtube_60", "preview_30"]},
+        "music_gain": {"type": "number", "minimum": 0, "maximum": 1.5},
+        "gameplay_gain": {"type": "number", "minimum": 0, "maximum": 1.5}
+      },
+      "additionalProperties": true
+    },
+    "sources": {"type": "array", "items": {"type": "object", "required": ["media_id", "path"]}},
+    "events": {"type": "array", "items": {"type": "object", "required": ["event_id", "source_media_id", "source_time_us", "in_us", "out_us", "owner", "confidence", "tags", "is_user_override"]}},
+    "timeline": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["clip_id", "event_id", "source_media_id", "in_us", "out_us", "output_start_frame", "duration_frames", "effects"],
+        "properties": {
+          "included_event_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "uniqueItems": true}
+        },
+        "additionalProperties": true
+      }
+    },
+    "music": {"type": ["object", "null"]}
+  },
+  "additionalProperties": true
+}

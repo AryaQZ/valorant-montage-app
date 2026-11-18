@@ -164,7 +164,8 @@ def probe_media(path_value: str, *, sample_vfr: bool = True) -> dict[str, Any]:
         },
         "audio": [{"codec": stream.get("codec_name"), "sample_rate": stream.get("sample_rate"),
                    "channels": stream.get("channels"), "channel_layout": stream.get("channel_layout"),
-                   "start_time_us": _to_us(stream.get("start_time")) or 0} for stream in audio],
+                   "start_time_us": _to_us(stream.get("start_time")),
+                   "duration_us": _to_us(stream.get("duration"))} for stream in audio],
         "has_audio": bool(audio),
     }
 

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 
 from .media import MediaToolError
+from .upstream import analyze_music_attacks
 
 
 def analyze_music(path_value: str, *, max_minutes: int = 15) -> dict[str, Any]:
@@ -79,7 +80,15 @@ def analyze_music(path_value: str, *, max_minutes: int = 15) -> dict[str, Any]:
             beats.append({"marker_id": f"beat-{len(beats) + 1:05d}", "time_us": time_us,
                           "confidence": round(confidence, 3), "kind": "beat_candidate"})
         index += period
-    return {"bpm_estimate": bpm, "confidence": round(confidence, 3),
-            "duration_us": duration_us, "sample_rate": sample_rate,
-            "method": "10ms RMS energy novelty autocorrelation; beat candidates require review",
-            "beat_grid": beats, "waveform": waveform}
+    result = {"bpm_estimate": bpm, "confidence": round(confidence, 3),
+              "duration_us": duration_us, "sample_rate": sample_rate,
+              "method": "10ms RMS energy novelty autocorrelation; beat candidates require review",
+              "beat_grid": beats, "waveform": waveform}
+    try:
+        precise = analyze_music_attacks(str(path), result)
+    except MediaToolError as exc:
+        result["upstream_warning"] = str(exc)
+    else:
+        if precise:
+            result.update(precise)
+    return result

@@ -1,18 +1,24 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createWriteStream, existsSync } from 'node:fs';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { createReadStream, createWriteStream, existsSync } from 'node:fs';
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { Readable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, protocol, safeStorage, shell } from 'electron';
 import { CHATGPT_USAGE_URL, ChatGPTError, createChatGPT, type ChatGPTClient,
   type ChatGPTModel, type LoginProfile, type SessionState } from '@siwc/local';
-import type { AIState, AIDraftResult, RenderJob, WorkerState } from '../shared/bridge.js';
-import type { Project } from '../shared/project.js';
+import type { AIState, AIDraftResult, KillCandidate, RenderJob, WorkerState } from '../shared/bridge.js';
+import { rebuildTimeline, type Project } from '../shared/project.js';
 import { validateAIProposal } from '../shared/director.js';
 import { createElectronCredentialEncryption } from './credential-encryption.js';
+import { requestLocalWorker } from './worker-client.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const isPackaged = app.isPackaged;
+protocol.registerSchemesAsPrivileged([{ scheme: 'vms-media', privileges: {
+  standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true,
+} }]);
 app.setName('VALORANT Montage Studio');
 app.setPath('userData', join(app.getPath('appData'), 'VALORANT Montage Studio'));
 
@@ -39,6 +45,7 @@ let selectedModel = '';
 const aiUsage = new Map<string, number>();
 const userApprovedProjectPaths = new Set<string>();
 const userApprovedOutputArtifacts = new Set<string>();
+const cacheMediaPaths = new Map<string, string>();
 
 function repositoryRoot(): string {
   if (isPackaged) return join(process.resourcesPath, 'worker');
@@ -139,25 +146,10 @@ function findCredentialWorker(): Promise<void> {
 }
 
 async function workerRequest<T>(method: 'GET' | 'POST' | 'DELETE', route: string, body?: unknown, timeoutMs = 60_000): Promise<T> {
-  if (!worker || worker.exitCode !== null || !workerPort || !workerToken) throw new Error('The local media worker is not connected.');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(`http://127.0.0.1:${workerPort}${route}`, {
-      method,
-      headers: { Authorization: `Bearer ${workerToken}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-      body: body === undefined ? undefined : JSON.stringify(body),
-      signal: controller.signal,
-      cache: 'no-store',
-      redirect: 'error',
-    });
-    const text = await response.text();
-    let payload: Record<string, unknown> = {};
-    try { payload = text ? JSON.parse(text) as Record<string, unknown> : {}; }
-    catch { throw new Error('Local worker returned invalid JSON.'); }
-    if (!response.ok) throw new Error(typeof payload.error === 'string' ? payload.error : `Local worker returned HTTP ${response.status}.`);
-    return payload as T;
-  } finally { clearTimeout(timer); }
+  const port = workerPort;
+  const token = workerToken;
+  if (!worker || worker.exitCode !== null || !port || !token) throw new Error('The local media worker is not connected.');
+  return requestLocalWorker<T>({ port, token, method, route, body, timeoutMs });
 }
 
 function assertRenderer(event: Electron.IpcMainInvokeEvent): void {
@@ -249,7 +241,71 @@ function fileUrlForCache(pathValue: unknown): string | null {
   if (typeof pathValue !== 'string' || !isInsideCache(pathValue)) return null;
   const extension = extname(pathValue).toLowerCase();
   if (!['.mp4', '.png', '.jpg', '.jpeg'].includes(extension)) return null;
-  return pathToFileURL(resolve(pathValue)).href;
+  const token = randomUUID();
+  cacheMediaPaths.set(token, resolve(pathValue));
+  return `vms-media://cache/${token}`;
+}
+
+function registerCacheMediaProtocol(): void {
+  protocol.handle('vms-media', async (request) => {
+    let token = '';
+    try {
+      const url = new URL(request.url);
+      if (url.hostname === 'cache' && !url.search && !url.hash) token = url.pathname.slice(1);
+    } catch { /* return a uniform not-found response for malformed URLs */ }
+    if (!/^[0-9a-f-]{36}$/i.test(token)) return new Response('Not found', { status: 404 });
+    const pathValue = cacheMediaPaths.get(token);
+    if (!pathValue || !isInsideCache(pathValue) || !existsSync(pathValue)) {
+      cacheMediaPaths.delete(token);
+      return new Response('Not found', { status: 404 });
+    }
+    if (request.method !== 'GET' && request.method !== 'HEAD') return new Response('Method not allowed', { status: 405 });
+    try {
+      const metadata = await stat(pathValue);
+      const total = metadata.size;
+      let start = 0;
+      let end = Math.max(total - 1, 0);
+      let status = 200;
+      const range = request.headers.get('range');
+      if (range) {
+        const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+        if (!match || (!match[1] && !match[2]) || total === 0) {
+          return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${total}` } });
+        }
+        if (!match[1]) {
+          const suffixLength = Number(match[2]);
+          if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) {
+            return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${total}` } });
+          }
+          start = Math.max(total - suffixLength, 0);
+        } else {
+          start = Number(match[1]);
+          end = match[2] ? Number(match[2]) : total - 1;
+          if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= total || end < start) {
+            return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${total}` } });
+          }
+          end = Math.min(end, total - 1);
+        }
+        status = 206;
+      }
+      const extension = extname(pathValue).toLowerCase();
+      const contentType = extension === '.mp4' ? 'video/mp4' : extension === '.png' ? 'image/png' : 'image/jpeg';
+      const contentLength = Math.max(0, end - start + 1);
+      const headers = new Headers({
+        'Accept-Ranges': 'bytes',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-store',
+        'Content-Length': String(contentLength),
+        'Content-Type': contentType,
+      });
+      if (status === 206) headers.set('Content-Range', `bytes ${start}-${end}/${total}`);
+      const body = request.method === 'HEAD' || total === 0 ? null :
+        Readable.toWeb(createReadStream(pathValue, { start, end })) as ReadableStream<Uint8Array>;
+      return new Response(body, { status, headers });
+    } catch {
+      return new Response('Media unavailable', { status: 404 });
+    }
+  });
 }
 
 function startChatGPT(): void {
@@ -307,7 +363,8 @@ function aiInstructions(error?: string): string {
     'Use only event IDs and beat marker IDs supplied in the user input. Never invent a kill or a timestamp.',
     'Preserve every confidence >= 0.75 multikill event. Keep each event impact inside its clip source range.',
     'Make an editable proposal only. Do not claim that cuts are beat-aligned unless the selected marker is within 80 ms of that event impact after preceding clip durations.',
-    'Allowed fields: selected_event_ids:string[], clip_plans:[{event_id:string,in_us:integer,out_us:integer,slot:integer}], beat_targets:[{marker_id:string,impact_event_id:string,intended_time_us:integer}], effects:[{event_id:string,type:"impact_zoom",max_zoom:number}], rationale:string[], confidence:number, warnings:string[].',
+    'Each selected event must appear exactly once, either as a clip plan event_id or in that plan\'s included_event_ids. Strongly overlapping events from the same source may share one sequence only when every impact stays visible.',
+    'Allowed fields: selected_event_ids:string[], clip_plans:[{event_id:string,included_event_ids?:string[],in_us:integer,out_us:integer,slot:integer}], beat_targets:[{marker_id:string,impact_event_id:string,intended_time_us:integer}], effects:[{event_id:string,type:"impact_zoom",max_zoom:number}], rationale:string[], confidence:number, warnings:string[].',
     'Effects must remain within the supplied Smooth/Clean intensity range. Keep reasons brief and refer only to supplied evidence.',
     ...(error ? [`The previous JSON failed local validation: ${error}. Return a corrected complete object.`] : []),
   ].join('\n');
@@ -389,6 +446,13 @@ function setupIpc(): void {
     return media;
   });
 
+  ipcMain.handle('vms:detect-kills', async (event, source: { media_id: string; path: string }) => {
+    assertRenderer(event);
+    if (!source || typeof source.media_id !== 'string' || typeof source.path !== 'string') throw new Error('Invalid source selected for kill review.');
+    return workerRequest<{ candidates: KillCandidate[]; upstream_commit: string; status: string }>(
+      'POST', '/v1/events/detect', { source_media_id: source.media_id, path: source.path }, 60 * 60_000);
+  });
+
   ipcMain.handle('vms:import-music', async (event) => {
     assertRenderer(event);
     const selection = await dialog.showOpenDialog(trustedWindow(), { title: 'Import music you are licensed to use', properties: ['openFile'], filters: AUDIO_FILTERS });
@@ -401,7 +465,8 @@ function setupIpc(): void {
 
   ipcMain.handle('vms:save-project', async (event, project: Project, currentPath?: string | null) => {
     assertRenderer(event);
-    await workerRequest('POST', '/v1/project/validate', { project });
+    const validation = await workerRequest<{ project: Project }>('POST', '/v1/project/validate', { project });
+    project = validation.project;
     let path = currentPath && isAbsolute(currentPath) && userApprovedProjectPaths.has(resolve(currentPath))
       ? resolve(currentPath) : undefined;
     if (!path) {
@@ -423,8 +488,9 @@ function setupIpc(): void {
       filters: [{ name: 'VMS project JSON', extensions: ['json'] }] });
     if (selection.canceled || !selection.filePaths[0]) return null;
     const path = selection.filePaths[0];
-    const project = JSON.parse(await readFile(path, 'utf8')) as Project;
-    await workerRequest('POST', '/v1/project/validate', { project });
+    const imported = JSON.parse(await readFile(path, 'utf8')) as Project;
+    const validation = await workerRequest<{ project: Project }>('POST', '/v1/project/validate', { project: imported });
+    const project = validation.project;
     userApprovedProjectPaths.add(resolve(path));
     for (const source of project.sources) {
       source.preview_url = fileUrlForCache(source.proxy_path);
@@ -435,7 +501,8 @@ function setupIpc(): void {
 
   ipcMain.handle('vms:autosave-project', async (event, project: Project) => {
     assertRenderer(event);
-    await workerRequest('POST', '/v1/project/validate', { project });
+    const validation = await workerRequest<{ project: Project }>('POST', '/v1/project/validate', { project });
+    project = validation.project;
     const path = join(app.getPath('userData'), 'autosave', `${project.project_id}.vmsproj.json`);
     await atomicWrite(path, `${JSON.stringify(project, null, 2)}\n`);
     await workerRequest('POST', '/v1/library/index', { project, json_path: path });
@@ -459,6 +526,26 @@ function setupIpc(): void {
     if (preflight.errors.length) throw new Error(preflight.errors.join('\n'));
     const job = await workerRequest<{ job_id: string }>('POST', '/v1/render', body);
     return { job_id: job.job_id, output_path: outputPath };
+  });
+
+  ipcMain.handle('vms:render-preview', async (event, project: Project,
+    mode: 'rough_preview' | 'effects_preview', acknowledgements: { rights: boolean; ownership: boolean }) => {
+    assertRenderer(event);
+    if (mode !== 'rough_preview' && mode !== 'effects_preview') throw new Error('Preview mode is invalid.');
+    const previewProject = structuredClone(project);
+    previewProject.settings.output_profile = mode === 'rough_preview' ? 'preview_30' : 'youtube_60';
+    rebuildTimeline(previewProject);
+    const outputPath = join(cacheRoot(), 'previews', `${previewProject.project_id}-${mode}-${Date.now()}.mp4`);
+    await mkdir(dirname(outputPath), { recursive: true });
+    const body = { project: previewProject, output_path: outputPath,
+      rights_acknowledged: Boolean(acknowledgements?.rights),
+      ownership_acknowledged: Boolean(acknowledgements?.ownership), render_mode: mode };
+    const preflight = await workerRequest<{ errors: string[] }>('POST', '/v1/render/preflight', body);
+    if (preflight.errors.length) throw new Error(preflight.errors.join('\n'));
+    const job = await workerRequest<{ job_id: string }>('POST', '/v1/render', body);
+    const previewUrl = fileUrlForCache(outputPath);
+    if (!previewUrl) throw new Error('Preview output could not be mapped into the local cache.');
+    return { job_id: job.job_id, output_path: outputPath, preview_url: previewUrl };
   });
 
   ipcMain.handle('vms:render-job', async (event, jobId: string) => {
@@ -581,7 +668,7 @@ async function signInWithChatGPT(options: Parameters<ChatGPTClient['signIn']>[0]
 }
 
 async function createWindow(): Promise<void> {
-  const preloadPath = join(here, '../preload/index.mjs');
+  const preloadPath = join(here, '../preload/index.cjs');
   mainWindow = new BrowserWindow({
     width: 1480, height: 940, minWidth: 1180, minHeight: 740,
     backgroundColor: '#0d1016', show: false,
@@ -612,6 +699,7 @@ async function createWindow(): Promise<void> {
 }
 
 app.whenReady().then(async () => {
+  registerCacheMediaProtocol();
   await loadLocalSettings();
   startChatGPT();
   await findCredentialWorker();

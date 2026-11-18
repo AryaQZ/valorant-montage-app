@@ -9,7 +9,10 @@ export default defineConfig({
   },
   preload: {
     plugins: [externalizeDepsPlugin()],
-    build: { outDir: resolve(__dirname, 'dist-electron/preload'), rollupOptions: { input: { index: resolve(__dirname, 'electron/preload.ts') } } },
+    build: { outDir: resolve(__dirname, 'dist-electron/preload'), rollupOptions: {
+      input: { index: resolve(__dirname, 'electron/preload.ts') },
+      output: { format: 'cjs', entryFileNames: 'index.cjs' },
+    } },
   },
   renderer: {
     root: resolve(__dirname, 'renderer'),

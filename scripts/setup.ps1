@@ -1,5 +1,10 @@
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$git = Get-Command git -ErrorAction SilentlyContinue
+if (-not $git) { throw 'Git for Windows is required to initialize the pinned third-party submodules.' }
+& $git.Source -C $repoRoot submodule update --init --recursive
+if ($LASTEXITCODE -ne 0) { throw 'Pinned third-party dependency checkout failed.' }
+
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) { throw 'Node.js 22.12.0 or newer is required. Install Node.js, then run this script again.' }
 $nodeVersion = [version]((& node -p 'process.versions.node').Trim())

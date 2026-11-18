@@ -20,6 +20,7 @@ from .library import index_project, list_projects
 from .media import MediaToolError, create_preview_assets, find_media_tools, probe_audio, probe_media
 from .render import preflight
 from .schema import ProjectValidationError, validate_project
+from .upstream import capabilities as upstream_capabilities, detect_kills
 
 MAX_BODY_BYTES = 8 * 1024 * 1024
 LOG = logging.getLogger("montage.worker")
@@ -53,7 +54,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok", "worker_version": __version__})
         elif route == "/v1/capabilities":
             self._json(200, {"worker_version": __version__, "media": find_media_tools(),
-                             "platform": sys.platform})
+                             "platform": sys.platform, "upstream": upstream_capabilities()})
         elif route.startswith("/v1/jobs/"):
             job = self.server.jobs.get(unquote(route.rsplit("/", 1)[-1]))
             self._json(200 if job else 404, job or {"error": "Job tidak ditemukan."})
@@ -82,10 +83,16 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 self._json(200, media)
             elif route == "/v1/music/analyze":
                 self._json(200, analyze_music(body.get("path", "")))
+            elif route == "/v1/events/detect":
+                source_id = body.get("source_media_id")
+                if not isinstance(source_id, str) or not source_id or len(source_id) > 80:
+                    raise ValueError("source_media_id tidak valid.")
+                media = probe_media(body.get("path", ""), sample_vfr=False)
+                self._json(200, detect_kills(media["path"], source_id, int(media["duration_us"])))
             elif route == "/v1/project/validate":
                 project = validate_project(body.get("project"), require_timeline=bool(body.get("require_timeline")))
                 self._json(200, {"valid": True, "event_count": len(project["events"]),
-                                 "clip_count": len(project["timeline"])})
+                                 "clip_count": len(project["timeline"]), "project": project})
             elif route == "/v1/library/index":
                 counts = index_project(body.get("project"), body.get("json_path"))
                 self._json(200, {"indexed": True, "counts": counts})

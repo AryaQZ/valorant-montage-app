@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChatGPTConnectionCard } from '@siwc/react';
 import '@siwc/react/styles.css';
-import type { AIState, RenderJob, WorkerState } from '../../shared/bridge.js';
-import { applyProposal, createProject, FPS, makeClip, rebuildTimeline, type DirectorProposal,
-  type HighlightEvent, type MediaSource, type Project } from '../../shared/project.js';
+import type { AIState, KillCandidate, RenderJob, WorkerState } from '../../shared/bridge.js';
+import { applyProposal, createProject, FPS, makeAutomaticEffects, makeClip, makePostKillSpeedRamp, rebuildTimeline,
+  toggleReverseImpactReplay, type DirectorProposal,
+  type Effect, type HighlightEvent, type MediaSource, type Project } from '../../shared/project.js';
 import { buildRuleProposal } from '../../shared/director.js';
 
 type Notice = { kind: 'error' | 'success' | 'info'; text: string };
@@ -45,10 +46,13 @@ export default function App() {
   const [aiUsageCount, setAIUsageCount] = useState(0);
   const [renderJobId, setRenderJobId] = useState('');
   const [renderJob, setRenderJob] = useState<RenderJob | null>(null);
+  const [previewRenderUrl, setPreviewRenderUrl] = useState('');
+  const [renderMode, setRenderMode] = useState<'master' | 'rough_preview' | 'effects_preview'>('master');
   const [showExportReview, setShowExportReview] = useState(false);
   const [musicRights, setMusicRights] = useState(false);
   const [ownerRights, setOwnerRights] = useState(false);
   const [draggingClip, setDraggingClip] = useState('');
+  const [killCandidates, setKillCandidates] = useState<KillCandidate[]>([]);
 
   useEffect(() => { projectRef.current = project; }, [project]);
 
@@ -59,7 +63,7 @@ export default function App() {
       if (!active) return;
       setWorkerState(worker);
       setAIState(ai);
-      setNotice({ kind: 'success', text: 'Studio siap. Baseline deteksi saat ini memakai anotasi manual.' });
+      setNotice({ kind: 'success', text: 'Studio siap. Rekaman tetap diproses lokal.' });
     }).catch(error => active && setNotice({ kind: 'error', text: getError(error) }));
     return () => { active = false; unsubscribe(); };
   }, []);
@@ -95,8 +99,11 @@ export default function App() {
         if (['complete', 'needs_review', 'failed', 'cancelled'].includes(job.status)) {
           setRenderJobId('');
           setBusy('');
+            if (job.status === 'failed' || job.status === 'cancelled') setPreviewRenderUrl('');
           setNotice({ kind: job.status === 'complete' ? 'success' : job.status === 'failed' ? 'error' : 'info',
-            text: job.status === 'complete' ? 'Render selesai dan lulus pemeriksaan.' : job.status === 'needs_review' ? 'Render selesai; laporan QA meminta pemeriksaan.' : job.error || job.message });
+            text: job.status === 'complete'
+              ? renderMode === 'master' ? 'Render selesai dan lulus pemeriksaan.' : 'Preview montage selesai; FFprobe dan QC memeriksa file hasil.'
+              : job.status === 'needs_review' ? 'Render selesai; laporan QA meminta pemeriksaan.' : job.error || job.message });
           return;
         }
         timer = window.setTimeout(poll, 900);
@@ -122,11 +129,22 @@ export default function App() {
   const selectedSource = project.sources.find(item => item.media_id === selectedSourceId) ?? null;
   const selectedClip = project.timeline.find(item => item.clip_id === selectedClipId) ?? null;
   const selectedEvent = selectedClip ? project.events.find(item => item.event_id === selectedClip.event_id) : null;
+  const selectedClipEventIds = selectedClip?.included_event_ids ?? (selectedClip ? [selectedClip.event_id] : []);
+  const selectedClipEvents = selectedClipEventIds.map(id => project.events.find(item => item.event_id === id))
+    .filter((event): event is HighlightEvent => Boolean(event));
+  const earliestIncludedImpact = Math.min(...selectedClipEvents.map(event => event.source_time_us));
+  const latestIncludedImpact = Math.max(...selectedClipEvents.map(event => event.source_time_us));
+  const zoomEffect = selectedClip?.effects.find((effect): effect is Extract<Effect, { type: 'impact_zoom' }> => effect.type === 'impact_zoom');
   const previewSource = selectedClip ? project.sources.find(item => item.media_id === selectedClip.source_media_id) ?? null : selectedSource;
   const selectedFPS = FPS[project.settings.output_profile];
   const timelineSeconds = project.timeline.reduce((sum, clip) => sum + clip.duration_frames / selectedFPS, 0);
   const ownerUnknownCount = project.timeline.filter(clip => project.events.find(event => event.event_id === clip.event_id)?.owner === 'unknown').length;
+  const previewAllowed = (!project.music || musicRights) && (ownerUnknownCount === 0 || ownerRights);
   const capabilitiesReady = workerState?.media.available ?? false;
+  const workerStatusClass = workerState ? (capabilitiesReady ? 'ok' : 'warn') : 'pending';
+  const workerStatusLabel = !workerState ? 'CHECKING FFMPEG' : capabilitiesReady ? 'FFMPEG READY' : 'FFMPEG REQUIRED';
+  const workerDiagnostic = workerState?.media.diagnostic ?? (workerState ? 'CPU H.264 render via libx264 when installed' : 'Checking local render tools…');
+  const upstreamDiagnostic = !workerState ? 'checking runtime' : `${workerState.upstream?.rife_model_available ? 'v4.25 detected' : 'not configured'} · kill review: ${workerState.upstream?.kill_detection ? 'available' : 'manual baseline'}`;
   const aiConnected = aiState?.session.status === 'connected';
   const aiCanPlan = Boolean(aiConnected && aiState?.session.sharing && aiState?.modelCatalog.status === 'ready' && aiState.selectedModel);
   const modelLabel = useMemo(() => aiState?.modelCatalog.models.find(model => model.slug === aiState.selectedModel)?.displayName ?? aiState?.selectedModel ?? 'Pilih model', [aiState]);
@@ -139,6 +157,7 @@ export default function App() {
     redoStack.current = [];
     projectRef.current = next;
     setProject(next);
+    setPreviewRenderUrl('');
   }
 
   function replaceProject(next: Project) {
@@ -146,6 +165,7 @@ export default function App() {
     redoStack.current = [];
     projectRef.current = next;
     setProject(next);
+    setPreviewRenderUrl('');
   }
 
   function undo() {
@@ -204,6 +224,31 @@ export default function App() {
     };
     commit(draft => { draft.events.push(event); });
     setNotice({ kind: 'success', text: 'Highlight manual ditambahkan. Tidak ada kill yang dideteksi otomatis.' });
+  }
+
+  async function detectKillCandidates() {
+    if (!selectedSource) return setNotice({ kind: 'error', text: 'Pilih rekaman sebelum mencari kandidat kill.' });
+    setBusy('Menganalisis kandidat kill secara lokal'); setNotice(null);
+    try {
+      const result = await window.vms.detectKills(selectedSource);
+      setKillCandidates(result.candidates);
+      setNotice({ kind: 'success', text: result.candidates.length
+        ? `${result.candidates.length} kandidat upstream siap ditinjau. Tidak ada yang ditambahkan otomatis ke timeline.`
+        : 'Upstream tidak menemukan kandidat kill pada rekaman ini.' });
+    } catch (error) { setNotice({ kind: 'error', text: getError(error) }); }
+    finally { setBusy(''); }
+  }
+
+  function confirmKillCandidate(candidate: KillCandidate) {
+    const event: HighlightEvent = {
+      event_id: uuid(), source_media_id: candidate.source_media_id, source_time_us: candidate.source_time_us,
+      source_frame: candidate.source_frame, in_us: candidate.in_us, out_us: candidate.out_us,
+      evidence: [...candidate.evidence, { type: 'user_reviewed_upstream_candidate', created_utc: new Date().toISOString() }],
+      owner: 'player', confidence: candidate.confidence, tags: [...candidate.suggested_tags], cluster_id: null, rating: null, is_user_override: true,
+    };
+    commit(draft => { if (!draft.events.some(item => item.source_media_id === event.source_media_id && item.source_time_us === event.source_time_us)) draft.events.push(event); });
+    setKillCandidates(items => items.filter(item => item.candidate_id !== candidate.candidate_id));
+    setNotice({ kind: 'success', text: 'Kandidat ditinjau dan ditambahkan sebagai anotasi. Periksa gambar kill sebelum menyusun cut.' });
   }
 
   function addClip(event: HighlightEvent) {
@@ -284,14 +329,79 @@ export default function App() {
       if (!clip) return;
       if (field === 'in_us') clip.in_us = Math.max(selectedEvent.in_us, Math.min(value, selectedEvent.source_time_us));
       else clip.out_us = Math.min(selectedEvent.out_us, Math.max(value, selectedEvent.source_time_us));
+      clip.time_remap = [{ output_start_frame: 0, output_end_frame: 0, source_start_us: clip.in_us,
+        source_end_us: clip.out_us, speed_num: 1, speed_den: 1, direction: 'forward' }];
       rebuildTimeline(draft);
+    });
+  }
+
+  function applySpeedRamp() {
+    if (!selectedClip || !selectedEvent) return;
+    commit(draft => {
+      const clip = draft.timeline.find(item => item.clip_id === selectedClip.clip_id);
+      if (!clip) return;
+      clip.time_remap = makePostKillSpeedRamp(selectedEvent, clip.in_us, clip.out_us, FPS[draft.settings.output_profile]);
+      rebuildTimeline(draft);
+    });
+  }
+
+  function setReverseReplay(enabled: boolean) {
+    if (!selectedClip || !selectedEvent) return;
+    commit(draft => {
+      const clip = draft.timeline.find(item => item.clip_id === selectedClip.clip_id);
+      if (!clip) return;
+      toggleReverseImpactReplay(clip, selectedEvent, enabled, FPS[draft.settings.output_profile]);
+      rebuildTimeline(draft);
+    });
+  }
+
+  function setClipTransition(enabled: boolean) {
+    if (!selectedClip) return;
+    commit(draft => {
+      const clip = draft.timeline.find(item => item.clip_id === selectedClip.clip_id);
+      if (!clip) return;
+      clip.transitions = enabled ? [{ type: 'dip_to_black', duration_frames: 8, enabled: true }] : [];
+    });
+  }
+
+  function setClipEffect(type: Effect['type'], enabled: boolean) {
+    if (!selectedClip || !selectedEvent) return;
+    commit(draft => {
+      const clip = draft.timeline.find(item => item.clip_id === selectedClip.clip_id);
+      if (!clip) return;
+      const existing = clip.effects.find(effect => effect.type === type);
+      if (existing) { existing.enabled = enabled; return; }
+      if (!enabled) return;
+      const automatic = makeAutomaticEffects(selectedEvent, draft.settings.effects_intensity).find(effect => effect.type === type);
+      if (automatic) { clip.effects.push(automatic); return; }
+      const intensity = Math.max(0.1, draft.settings.effects_intensity);
+      if (type === 'impact_zoom') clip.effects.push({ type, max_zoom: 1 + 0.04 * intensity, duration_frames: 24,
+        anchor: 'impact', enabled: true, keyframes: [{ frame_offset: -12, scale: 1 },
+          { frame_offset: 0, scale: 1 + 0.04 * intensity }, { frame_offset: 12, scale: 1 }] });
+      else if (type === 'impact_flash') clip.effects.push({ type, intensity: 0.12 * intensity, duration_frames: 3, enabled: true });
+      else if (type === 'screen_shake') clip.effects.push({ type, amplitude_px: 4 * intensity, duration_frames: 10, enabled: true });
+      else clip.effects.push({ type, strength: 0.16 * intensity, window_frames: 3, enabled: true });
+    });
+  }
+
+  function setZoomPeak(scale: number) {
+    if (!selectedClip || !Number.isFinite(scale)) return;
+    commit(draft => {
+      const clip = draft.timeline.find(item => item.clip_id === selectedClip.clip_id);
+      const effect = clip?.effects.find(item => item.type === 'impact_zoom');
+      if (!effect || effect.type !== 'impact_zoom') return;
+      effect.max_zoom = Math.max(1, Math.min(1.08, scale));
+      const peak = effect.max_zoom;
+      effect.keyframes = effect.keyframes?.length ? effect.keyframes.map(keyframe => ({
+        ...keyframe, scale: keyframe.frame_offset === 0 ? peak : keyframe.scale,
+      })) : [{ frame_offset: -12, scale: 1 }, { frame_offset: 0, scale: peak }, { frame_offset: 12, scale: 1 }];
     });
   }
 
   function newProject() {
     if (project.sources.length && !window.confirm('Mulai project baru? Project sekarang tetap tersimpan di autosave lokal.')) return;
     const next = createProject();
-    projectRef.current = next; setProject(next); setProjectPath(null); setProposal(null); setRenderJob(null);
+    projectRef.current = next; setProject(next); setProjectPath(null); setProposal(null); setRenderJob(null); setPreviewRenderUrl('');
     undoStack.current = []; redoStack.current = [];
     setSelectedSourceId(''); setSelectedClipId(''); setNotice({ kind: 'success', text: 'Project baru dibuat.' });
   }
@@ -308,6 +418,7 @@ export default function App() {
       const loaded = await window.vms.loadProject();
       if (!loaded) return;
       projectRef.current = loaded.project; setProject(loaded.project); setProjectPath(loaded.path); setProposal(null);
+      setPreviewRenderUrl('');
       undoStack.current = []; redoStack.current = [];
       setSelectedSourceId(loaded.project.sources[0]?.media_id ?? ''); setSelectedClipId(loaded.project.timeline[0]?.clip_id ?? '');
       setNotice({ kind: 'success', text: 'Project berhasil dibuka dan divalidasi.' });
@@ -315,6 +426,7 @@ export default function App() {
   }
 
   async function exportProject() {
+    setRenderMode('master');
     setBusy('Preparing export');
     try {
       setRenderJob(null);
@@ -324,6 +436,21 @@ export default function App() {
       setRenderJob({ job_id: pathResult.job_id, status: 'queued', progress: 0, message: `Menyiapkan ${pathResult.output_path}` });
     } catch (error) { setNotice({ kind: 'error', text: getError(error) }); }
     finally { setBusy(current => current === 'Preparing export' ? '' : current); }
+  }
+
+  async function renderPreview(mode: 'rough_preview' | 'effects_preview') {
+    setRenderMode(mode);
+    setBusy('Preparing preview');
+    try {
+      setRenderJob(null);
+      const result = await window.vms.renderPreview(project, mode, { rights: musicRights, ownership: ownerRights });
+      setPreviewRenderUrl(result.preview_url);
+      setRenderJobId(result.job_id);
+      setBusy('Rendering');
+      setRenderJob({ job_id: result.job_id, status: 'queued', progress: 0,
+        message: `Membuat ${mode === 'rough_preview' ? 'rough preview 1280×720/30' : 'effects preview 2560×1440/60'}` });
+    } catch (error) { setNotice({ kind: 'error', text: getError(error) }); }
+    finally { setBusy(current => current === 'Preparing preview' ? '' : current); }
   }
 
   async function cancelRender() {
@@ -337,7 +464,7 @@ export default function App() {
     catch (error) { setNotice({ kind: 'error', text: getError(error) }); }
   }
 
-  const previewUrl = previewSource?.preview_url ?? '';
+  const previewUrl = previewRenderUrl || previewSource?.preview_url || '';
   const previewKey = `${previewUrl}:${selectedClip?.in_us ?? 0}`;
   const completedRender = renderJob?.result;
 
@@ -368,7 +495,7 @@ export default function App() {
             </button>) : <div className="empty-card"><div className="empty-symbol">▧</div><strong>Belum ada rekaman</strong><span>Impor video gameplay untuk mulai memilih highlight.</span></div>}
           </div>
 
-          <div className="section-head highlight-heading"><div><span className="eyebrow">ANNOTATION</span><h2>Highlight review</h2></div><span className="count-pill">{project.events.length}</span></div>
+          <div className="section-head highlight-heading"><div><span className="eyebrow">ANNOTATION</span><h2>Highlight review</h2></div><button className="button subtle compact" onClick={() => void detectKillCandidates()} disabled={!selectedSource || Boolean(busy) || !workerState?.upstream?.kill_detection}>Find kills</button><span className="count-pill">{project.events.length}</span></div>
           {selectedSource ? <div className="annotation-card">
             <div className="annotation-source"><span className="record-dot" />{selectedSource.filename}</div>
             <div className="time-inputs">
@@ -389,38 +516,43 @@ export default function App() {
               </div>;
             })}
           </div>
+          {killCandidates.length > 0 && <div className="candidate-panel"><div className="candidate-title"><strong>UPSTREAM CANDIDATES</strong><small>Review the shot frame and feed before adding.</small></div>{killCandidates.map(candidate => <div className="candidate-card" key={candidate.candidate_id}><div><strong>{candidate.confidence_label.toUpperCase()} · K {candidate.source_frame}</strong><small>{timecode(candidate.source_time_us)} · {candidate.method} · feed {candidate.feed_frame ?? '—'}</small><small>{candidate.verified_by_upstream ? 'Upstream signal verified; visual review still required.' : 'Unverified candidate: check ownership and the exact impact frame.'}</small>{candidate.suggested_tags.length > 0 && <small>Upstream context: {candidate.suggested_tags.map(tag => tag.replace('_', ' ')).join(' · ')}</small>}</div><button className="add-small" title="Confirm after reviewing candidate" onClick={() => confirmKillCandidate(candidate)}>Review +</button></div>)}</div>}
+          {workerState?.upstream && !workerState.upstream.kill_detection && <div className="empty-inline">Upstream kill detector is unavailable. Manual annotations remain the baseline.</div>}
         </aside>
 
         <main className="edit-column">
           <div className="editor-toolbar">
             <div className="tab-strip"><button className="active">EDITOR <span>01</span></button><button disabled>COLOR <span>02</span></button><button disabled>AUDIO <span>03</span></button></div>
-            <div className="toolbar-right"><span className={`status-chip ${capabilitiesReady ? 'ok' : 'warn'}`}><i />{capabilitiesReady ? 'FFMPEG READY' : 'FFMPEG REQUIRED'}</span><span className="output-chip">{project.settings.output_profile === 'master_144' ? '144 FPS MASTER' : '60 FPS YOUTUBE'}</span></div>
+            <div className="toolbar-right"><span className={`status-chip ${workerStatusClass}`}><i />{workerStatusLabel}</span><span className="output-chip">{project.settings.output_profile === 'master_144' ? '144 FPS MASTER' : '60 FPS YOUTUBE'}</span></div>
           </div>
 
           <section className="preview-stage">
-            <div className="stage-topline"><span>PROGRAM MONITOR <b>·</b> {previewSource?.filename ?? 'NO SOURCE SELECTED'}</span><span>{timecode(selectedClip?.in_us ?? 0)} — {timecode(selectedClip?.out_us ?? previewSource?.duration_us ?? 0)}</span></div>
+            <div className="stage-topline"><span>{previewRenderUrl ? renderMode === 'rough_preview' ? 'ROUGH CUT · EFFECTS OFF · 720P30' : 'EFFECTS PREVIEW · VFX ON · 1440P60' : 'SOURCE CLIP REVIEW · EFFECTS OFF'} <b>·</b> {previewRenderUrl ? project.name : previewSource?.filename ?? 'NO SOURCE SELECTED'}</span><span>{previewRenderUrl ? `0:00 — ${timecode(timelineSeconds * 1_000_000)}` : `${timecode(selectedClip?.in_us ?? 0)} — ${timecode(selectedClip?.out_us ?? previewSource?.duration_us ?? 0)}`}</span></div>
             <div className="video-frame">
-              {previewUrl ? <video key={previewKey} ref={videoRef} src={previewUrl} controls playsInline onLoadedMetadata={() => { if (videoRef.current && selectedClip) videoRef.current.currentTime = selectedClip.in_us / 1_000_000; }} onTimeUpdate={() => { if (videoRef.current && selectedClip && videoRef.current.currentTime >= selectedClip.out_us / 1_000_000) videoRef.current.pause(); }} /> : <div className="preview-placeholder"><div className="crosshair">＋</div><strong>{previewSource ? 'Preview proxy unavailable' : 'Your cut starts here'}</strong><span>{previewSource ? 'Periksa FFmpeg dan impor ulang media untuk membuat proxy.' : 'Pilih rekaman dan tambahkan highlight ke timeline.'}</span><div className="placeholder-meta"><span>2560 × 1440</span><span>·</span><span>{selectedFPS} FPS</span><span>·</span><span>SMOOTH / CLEAN</span></div></div>}
+              {previewUrl ? <video key={previewKey} ref={videoRef} src={previewUrl} controls playsInline onLoadedMetadata={() => { if (videoRef.current) videoRef.current.currentTime = previewRenderUrl ? 0 : (selectedClip?.in_us ?? 0) / 1_000_000; }} onTimeUpdate={() => { if (!videoRef.current) return; if (previewRenderUrl && videoRef.current.currentTime >= timelineSeconds) videoRef.current.pause(); else if (!previewRenderUrl && selectedClip && videoRef.current.currentTime >= selectedClip.out_us / 1_000_000) videoRef.current.pause(); }} /> : <div className="preview-placeholder"><div className="crosshair">＋</div><strong>{previewSource ? 'Preview proxy unavailable' : 'Your cut starts here'}</strong><span>{previewSource ? 'Periksa FFmpeg dan impor ulang media untuk membuat proxy.' : 'Pilih rekaman dan tambahkan highlight ke timeline.'}</span><div className="placeholder-meta"><span>2560 × 1440</span><span>·</span><span>{selectedFPS} FPS</span><span>·</span><span>SMOOTH / CLEAN</span></div></div>}
               <div className="safe-frame"><span>REC ●</span></div>
             </div>
-            <div className="monitor-controls"><div className="play-controls"><button title="Previous clip" onClick={() => { const i = project.timeline.findIndex(item => item.clip_id === selectedClipId); setSelectedClipId(project.timeline[Math.max(0, i - 1)]?.clip_id ?? ''); }}>|◀</button><button className="play-button" onClick={() => { const video = videoRef.current; if (!video) return; if (video.paused) void video.play(); else video.pause(); }}>▶</button><button title="Next clip" onClick={() => { const i = project.timeline.findIndex(item => item.clip_id === selectedClipId); setSelectedClipId(project.timeline[Math.min(project.timeline.length - 1, i + 1)]?.clip_id ?? ''); }}>▶|</button></div><span className="monitor-time">{selectedClip ? timecode(selectedClip.in_us) : '00:00.00'} <i>/</i> {selectedClip ? timecode(selectedClip.out_us) : '00:00.00'}</span><span className="monitor-quality">FIT&nbsp;&nbsp; 100%</span></div>
+            <div className="monitor-controls"><div className="play-controls">{!previewRenderUrl && <button title="Previous clip" onClick={() => { const i = project.timeline.findIndex(item => item.clip_id === selectedClipId); setSelectedClipId(project.timeline[Math.max(0, i - 1)]?.clip_id ?? ''); }}>|◀</button>}<button className="play-button" onClick={() => { const video = videoRef.current; if (!video) return; if (video.paused) void video.play(); else video.pause(); }}>▶</button>{!previewRenderUrl && <button title="Next clip" onClick={() => { const i = project.timeline.findIndex(item => item.clip_id === selectedClipId); setSelectedClipId(project.timeline[Math.min(project.timeline.length - 1, i + 1)]?.clip_id ?? ''); }}>▶|</button>}{previewRenderUrl && <button title="Return to source clip review" onClick={() => setPreviewRenderUrl('')}>SOURCE</button>}</div><span className="monitor-time">{previewRenderUrl ? '00:00.00' : selectedClip ? timecode(selectedClip.in_us) : '00:00.00'} <i>/</i> {previewRenderUrl ? timecode(timelineSeconds * 1_000_000) : selectedClip ? timecode(selectedClip.out_us) : '00:00.00'}</span><span className="monitor-quality">FIT&nbsp;&nbsp; 100%</span></div>
           </section>
 
           <section className="timeline-section">
-            <div className="timeline-header"><div><span className="eyebrow">SEQUENCE</span><h2>Montage timeline <small>{project.timeline.length} clips · {timelineSeconds.toFixed(1)}s</small></h2></div><div className="timeline-actions"><button className="button subtle compact" onClick={generateRuleDraft} disabled={!project.events.length}>Generate draft</button><button className="button compact primary" onClick={() => setActivePanel('director')}>Creative Director <span>✦</span></button></div></div>
+            <div className="timeline-header"><div><span className="eyebrow">SEQUENCE</span><h2>Montage timeline <small>{project.timeline.length} clips · {timelineSeconds.toFixed(1)}s</small></h2></div><div className="timeline-actions"><button className="button subtle compact" onClick={() => void renderPreview('rough_preview')} disabled={!project.timeline.length || Boolean(busy) || !previewAllowed}>Quick rough · 720p30</button><button className="button subtle compact" onClick={() => void renderPreview('effects_preview')} disabled={!project.timeline.length || Boolean(busy) || !previewAllowed}>Effects preview · 1440p60</button><button className="button subtle compact" onClick={generateRuleDraft} disabled={!project.events.length}>Generate draft</button><button className="button compact primary" onClick={() => setActivePanel('director')}>Creative Director <span>✦</span></button></div></div>
             <div className="ruler"><span>00:00</span><span>00:10</span><span>00:20</span><span>00:30</span><span>{timecode(timelineSeconds * 1_000_000)}</span></div>
             <div className="track-row"><div className="track-label"><b>V1</b><span>GAMEPLAY</span></div><div className="track-content">
               {project.timeline.length ? project.timeline.map((clip, index) => {
                 const event = project.events.find(item => item.event_id === clip.event_id);
                 const source = project.sources.find(item => item.media_id === clip.source_media_id);
+                const impactCount = clip.included_event_ids?.length ?? 1;
+                const label = impactCount > 1 ? `MULTIKILL · ${impactCount} IMPACTS`
+                  : event?.tags[0]?.replace('_', ' ') ?? `Highlight ${index + 1}`;
                 return <div key={clip.clip_id} className={`timeline-clip ${clip.clip_id === selectedClipId ? 'selected' : ''}`} style={{ flexGrow: Math.max(0.6, clip.duration_frames / selectedFPS), flexBasis: 104 }} draggable onDragStart={() => setDraggingClip(clip.clip_id)} onDragEnd={() => setDraggingClip('')} onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); reorderClip(draggingClip, clip.clip_id); }} onClick={() => setSelectedClipId(clip.clip_id)}>
-                  <span className="clip-number">{String(index + 1).padStart(2, '0')}</span><span className="clip-icon">◢</span><div><strong>{event?.tags[0]?.replace('_', ' ') ?? `Highlight ${index + 1}`}</strong><small>{source?.filename ?? 'Source missing'}</small></div><span className="clip-duration">{(clip.duration_frames / selectedFPS).toFixed(1)}s</span>
+                  <span className="clip-number">{String(index + 1).padStart(2, '0')}</span><span className="clip-icon">◢</span><div><strong>{label}</strong><small>{source?.filename ?? 'Source missing'}</small></div><span className="clip-duration">{(clip.duration_frames / selectedFPS).toFixed(1)}s</span>
                 </div>;
               }) : <div className="track-empty">Tambah highlight dari library atau buat draft untuk mengisi timeline.</div>}
               <div className="playhead" />
             </div></div>
             <div className="audio-track-row"><div className="track-label"><b>A1</b><span>MUSIC</span></div><div className="audio-track-content">{project.music ? <div className="audio-lane"><div className="audio-lane-wave">{(project.music.waveform ?? []).map((height, index) => <i key={index} style={{ height: `${Math.max(8, height * 88)}%` }} />)}</div>{project.music.beat_grid.filter(marker => marker.time_us >= project.music!.offset_us && marker.time_us - project.music!.offset_us < timelineSeconds * 1_000_000).map(marker => <b key={marker.marker_id} style={{ left: `${(marker.time_us - project.music!.offset_us) / Math.max(1, timelineSeconds * 1_000_000) * 100}%` }} />)}<span>{project.music.bpm_estimate ?? '—'} BPM</span></div> : <div className="audio-track-empty">Import a licensed music track to view waveform and beat candidates.</div>}</div></div>
-            {selectedClip && selectedEvent && <div className="trim-row"><div className="track-label"><b>TRIM</b><span>SELECTED</span></div><div className="trim-controls"><label>IN <input type="number" step="0.01" min={seconds(selectedEvent.in_us)} max={seconds(selectedEvent.source_time_us)} value={seconds(selectedClip.in_us)} onChange={e => updateClip('in_us', Math.round(Number(e.target.value) * 1_000_000))} />s</label><span>→</span><label>OUT <input type="number" step="0.01" min={seconds(selectedEvent.source_time_us)} max={seconds(selectedEvent.out_us)} value={seconds(selectedClip.out_us)} onChange={e => updateClip('out_us', Math.round(Number(e.target.value) * 1_000_000))} />s</label><span className="trim-hint">Kill impact dipertahankan dalam trim</span><button className="remove-clip" title="Remove selected clip" onClick={() => { commit(draft => { draft.timeline = draft.timeline.filter(item => item.clip_id !== selectedClip.clip_id); rebuildTimeline(draft); }); setNotice({ kind: 'info', text: 'Clip dilepas dari timeline; anotasi sumber tetap ada.' }); }}>Remove clip ×</button></div></div>}
+            {selectedClip && selectedEvent && <div className="trim-row"><div className="track-label"><b>TRIM</b><span>SELECTED</span></div><div className="trim-controls"><label>IN <input type="number" step="0.01" min={seconds(selectedEvent.in_us)} max={seconds(earliestIncludedImpact)} value={seconds(selectedClip.in_us)} onChange={e => updateClip('in_us', Math.round(Number(e.target.value) * 1_000_000))} />s</label><span>→</span><label>OUT <input type="number" step="0.01" min={seconds(latestIncludedImpact)} max={seconds(selectedEvent.out_us)} value={seconds(selectedClip.out_us)} onChange={e => updateClip('out_us', Math.round(Number(e.target.value) * 1_000_000))} />s</label><span className="trim-hint">Semua impact sequence tetap berada dalam trim</span><button className="remove-clip" title="Remove selected clip" onClick={() => { commit(draft => { draft.timeline = draft.timeline.filter(item => item.clip_id !== selectedClip.clip_id); rebuildTimeline(draft); }); setNotice({ kind: 'info', text: 'Clip dilepas dari timeline; anotasi sumber tetap ada.' }); }}>Remove clip ×</button></div></div>}
           </section>
         </main>
 
@@ -431,7 +563,7 @@ export default function App() {
             <label className="field-label">Export preset<select value={project.settings.output_profile} onChange={e => commit(draft => { draft.settings.output_profile = e.target.value as Project['settings']['output_profile']; rebuildTimeline(draft); })}><option value="master_144">Master · 144 FPS</option><option value="youtube_60">YouTube · 60 FPS</option></select></label>
             <div className="resolution-box"><div><strong>2560 × 1440</strong><span>QHD · 16:9 · Progressive</span></div><b>{selectedFPS}<small> FPS</small></b></div>
             <div className="slider-control"><div><label>Beat sync priority</label><b>{Math.round(project.settings.beat_sync_priority * 100)}%</b></div><input type="range" min="0" max="1" step="0.01" value={project.settings.beat_sync_priority} onChange={e => commit(draft => { draft.settings.beat_sync_priority = Number(e.target.value); })}/><small>Soft preference; action timing stays intact.</small></div>
-            <div className="slider-control"><div><label>Effects intensity</label><b>{Math.round(project.settings.effects_intensity * 100)}%</b></div><input type="range" min="0" max="1" step="0.01" value={project.settings.effects_intensity} onChange={e => commit(draft => { draft.settings.effects_intensity = Number(e.target.value); for (const clip of draft.timeline) clip.effects = Number(e.target.value) > 0 ? [{ type: 'impact_zoom', max_zoom: Math.round((1 + 0.04 * Number(e.target.value)) * 10_000) / 10_000, duration_frames: 24, anchor: 'center', enabled: true }] : []; })}/><small>Impact zoom is bounded to 1.04×.</small></div>
+            <div className="slider-control"><div><label>Effects intensity</label><b>{Math.round(project.settings.effects_intensity * 100)}%</b></div><input type="range" min="0" max="1" step="0.01" value={project.settings.effects_intensity} onChange={e => commit(draft => { draft.settings.effects_intensity = Number(e.target.value); for (const clip of draft.timeline) { const ids = clip.included_event_ids ?? [clip.event_id]; const grouped = ids.map(id => draft.events.find(item => item.event_id === id)).filter((item): item is HighlightEvent => Boolean(item)); const event = grouped.find(item => item.event_id === clip.event_id); if (event) { const tags = [...new Set(grouped.flatMap(item => item.tags))]; if (grouped.length > 1 && !tags.includes('multikill')) tags.push('multikill'); const effective = { ...event, confidence: Math.max(...grouped.map(item => item.confidence)), tags }; clip.effects = makeAutomaticEffects(effective, Number(e.target.value)); } else clip.effects = []; } })}/><small>Context chooses zoom, flash, shake and blur by reviewed tags.</small></div>
             <div className="slider-control"><div><label>Gameplay audio</label><b>{Math.round(project.settings.gameplay_gain * 100)}%</b></div><input type="range" min="0" max="1.5" step="0.01" value={project.settings.gameplay_gain} onChange={e => commit(draft => { draft.settings.gameplay_gain = Number(e.target.value); for (const clip of draft.timeline) clip.audio_gain = Number(e.target.value); })}/></div>
             <div className="slider-control"><div><label>Music level</label><b>{Math.round(project.settings.music_gain * 100)}%</b></div><input type="range" min="0" max="0.75" step="0.01" value={project.settings.music_gain} onChange={e => commit(draft => { draft.settings.music_gain = Number(e.target.value); })}/></div>
 
@@ -439,18 +571,35 @@ export default function App() {
               {project.music && <><div className="waveform" aria-label="Music waveform">{(project.music.waveform?.length ? project.music.waveform : project.music.beat_grid.slice(0, 90).map(marker => marker.confidence)).map((height, i) => <i key={i} style={{ height: `${Math.max(8, height * 100)}%` }} />)}{project.music.beat_grid.slice(0, 18).map(marker => <b key={marker.marker_id} style={{ left: `${Math.min(99, marker.time_us / Math.max(1, project.music!.duration_us) * 100)}%` }} />)}</div><label className="field-label offset-field">Music offset <span className="suffix-input"><input type="number" step="0.01" min="0" value={seconds(project.music.offset_us)} onChange={e => commit(draft => { if (draft.music) draft.music.offset_us = Math.max(0, Math.round(Number(e.target.value) * 1_000_000)); })}/>sec</span></label><label className="check-row"><input type="checkbox" checked={musicRights} onChange={e => setMusicRights(e.target.checked)}/><span>I have rights to use this audio in my montage.</span></label></>}
             </div>
 
-            {selectedClip && <div className="clip-inspector"><div className="inspector-heading"><span className="eyebrow">SELECTED CLIP</span><h2>{selectedEvent?.tags[0]?.replace('_', ' ') ?? 'Highlight'}</h2></div><div className="detail-row"><span>Source</span><b>{project.sources.find(item => item.media_id === selectedClip.source_media_id)?.filename}</b></div><div className="detail-row"><span>Duration</span><b>{(selectedClip.duration_frames / selectedFPS).toFixed(2)} sec</b></div><div className="detail-row"><span>Ownership</span><b>{selectedEvent?.owner === 'player' ? 'Player confirmed' : 'Unknown'}</b></div><button className="button subtle full" onClick={() => { const index = project.timeline.findIndex(item => item.clip_id === selectedClip.clip_id); if (index > 0) reorderClip(selectedClip.clip_id, project.timeline[index - 1].clip_id); }}>Move clip earlier ↑</button></div>}
+            {selectedClip && <div className="clip-inspector">
+              <div className="inspector-heading"><span className="eyebrow">SELECTED CLIP</span><h2>{selectedEvent?.tags[0]?.replace('_', ' ') ?? 'Highlight'}</h2></div>
+              <div className="detail-row"><span>Source</span><b>{project.sources.find(item => item.media_id === selectedClip.source_media_id)?.filename}</b></div>
+              <div className="detail-row"><span>Duration</span><b>{(selectedClip.duration_frames / selectedFPS).toFixed(2)} sec · {selectedClip.time_remap.length} map sections</b></div>
+              <div className="detail-row"><span>Ownership</span><b>{selectedEvent?.owner === 'player' ? 'Player confirmed' : 'Unknown'}</b></div>
+              <div className="effect-controls"><span className="eyebrow">RENDERED EFFECTS</span>
+                {([['impact_zoom', 'Impact zoom'], ['impact_flash', 'Impact flash'], ['screen_shake', 'Screen shake'], ['motion_blur', 'Motion blur']] as const).map(([type, label]) => {
+                  const effect = selectedClip.effects.find(item => item.type === type);
+                  return <label className="check-row effect-toggle" key={type}><input type="checkbox" checked={effect?.enabled ?? false} onChange={event => setClipEffect(type, event.target.checked)}/><span>{label}</span><small>{effect?.enabled ? 'ON' : 'OFF'}</small></label>;
+                })}
+                {zoomEffect?.enabled && <div className="slider-control keyframe-control"><div><label>Impact zoom peak keyframe</label><b>{zoomEffect.max_zoom.toFixed(3)}×</b></div><input aria-label="Impact zoom peak keyframe" type="range" min="1" max="1.08" step="0.001" value={zoomEffect.max_zoom} onChange={event => setZoomPeak(Number(event.target.value))}/><small>Editable scale key at impact frame 0; neighboring keys ease in and out.</small></div>}
+              </div>
+              <button className="button subtle full" onClick={applySpeedRamp}>Apply post-kill speed ramp</button>
+              <label className="check-row reverse-toggle"><input type="checkbox" checked={selectedClip.time_remap.some(segment => segment.direction === 'reverse')} onChange={event => setReverseReplay(event.target.checked)}/><span>Reverse slow-motion replay accent</span></label>
+              <label className="check-row reverse-toggle"><input type="checkbox" checked={selectedClip.transitions.some(transition => transition.enabled)} onChange={event => setClipTransition(event.target.checked)}/><span>8-frame dip transition at this cut</span></label>
+              <small className="small-note">Reverse mode repeats a short post-impact section; no source frames are removed.</small>
+              <button className="button subtle full" onClick={() => { const index = project.timeline.findIndex(item => item.clip_id === selectedClip.clip_id); if (index > 0) reorderClip(selectedClip.clip_id, project.timeline[index - 1].clip_id); }}>Move clip earlier ↑</button>
+            </div>}
 
             {ownerUnknownCount > 0 && <label className="check-row ownership-check"><input type="checkbox" checked={ownerRights} onChange={e => setOwnerRights(e.target.checked)}/><span>Confirm that the {ownerUnknownCount} unknown-owner highlight(s) belong to or are authorized by me.</span></label>}
-            <div className="worker-status"><span className={`status-chip ${capabilitiesReady ? 'ok' : 'warn'}`}><i />{capabilitiesReady ? `FFMPEG ${workerState?.media.version ?? 'AVAILABLE'}` : 'FFMPEG + FFPROBE NEEDED'}</span><small>{workerState?.media.diagnostic ?? 'CPU H.264 render via libx264 when installed'}</small></div>
+            <div className="worker-status"><span className={`status-chip ${workerStatusClass}`}><i />{!workerState ? 'CHECKING FFMPEG' : capabilitiesReady ? `FFMPEG ${workerState.media.version ?? 'AVAILABLE'}` : 'FFMPEG + FFPROBE NEEDED'}</span><small>{workerDiagnostic}</small><small>Upstream RIFE: {upstreamDiagnostic}</small></div>
           </div> : <DirectorPanel aiState={aiState} aiCanPlan={aiCanPlan} aiConsent={aiConsent} setAIConsent={setAIConsent} modelLabel={modelLabel} aiUsageCount={aiUsageCount} project={project} proposal={proposal} busy={busy} onGenerateRule={generateRuleDraft} onGenerateAI={() => void generateAIProposal()} onAccept={acceptProposal} onReject={rejectProposal} onAI={handleAI} onTest={() => void testAIConnection()} onCancel={() => void cancelAIRequest()} />}
         </aside>
       </div>
 
       {showExportReview && <div className="modal-backdrop"><section className="export-modal" role="dialog" aria-modal="true" aria-labelledby="export-title"><div className="modal-kicker"><span className="live-dot" /> EXPORT PREFLIGHT</div><h2 id="export-title">Review before export</h2><p>Master output will render at 2560×1440, {selectedFPS} FPS. The worker checks source ranges, disk space, media paths, audio and output integrity before and after rendering.</p>{project.music ? <label className="check-row modal-check"><input type="checkbox" checked={musicRights} onChange={e => setMusicRights(e.target.checked)}/><span>I own or have permission to use “{project.music.filename}” in this montage.</span></label> : <div className="modal-note">No soundtrack is attached; gameplay audio will be used where available.</div>}{ownerUnknownCount > 0 && <label className="check-row modal-check"><input type="checkbox" checked={ownerRights} onChange={e => setOwnerRights(e.target.checked)}/><span>I confirm the {ownerUnknownCount} selected highlight(s) marked owner unknown are mine or authorized for this montage.</span></label>}<div className="modal-summary"><span>VIDEO</span><b>2560 × 1440 · {selectedFPS} FPS · H.264</b><span>QUALITY CHECK</span><b>FFprobe + black/silence scan</b></div><div className="modal-actions"><button className="button subtle" onClick={() => setShowExportReview(false)}>Cancel</button><button className="button primary" disabled={Boolean(busy) || (Boolean(project.music) && !musicRights) || (ownerUnknownCount > 0 && !ownerRights)} onClick={() => { setShowExportReview(false); void exportProject(); }}>Choose output and render <span>↗</span></button></div></section></div>}
       {notice && <div className={`toast ${notice.kind}`} role="status"><span>{notice.kind === 'error' ? '!' : notice.kind === 'success' ? '✓' : 'i'}</span><p>{notice.text}</p><button onClick={() => setNotice(null)}>×</button></div>}
-      {busy === 'Rendering' && renderJob && <div className="render-dock"><div className="render-copy"><span className="eyebrow">EXPORTING MONTAGE</span><strong>{renderJob.message}</strong></div><div className="progress-track"><i style={{ width: `${Math.round(renderJob.progress * 100)}%` }} /></div><b>{Math.round(renderJob.progress * 100)}%</b><button className="button subtle compact" onClick={() => void cancelRender()}>Cancel</button></div>}
-      {completedRender && <div className="qa-dock"><div><span className={`qa-status ${completedRender.qa.status.toLowerCase()}`}>{completedRender.qa.status}</span><strong>Export QA {completedRender.state === 'needs_review' ? 'needs review' : 'passed'}</strong><small>{completedRender.qa.checks.filter(item => item.status !== 'PASS').length} notes · {completedRender.output_path}</small></div><button className="button subtle compact" onClick={() => void window.vms.revealLocalFile(completedRender.qa_html)}>Open QA report</button><button className="button compact primary" onClick={() => void window.vms.revealLocalFile(completedRender.output_path)}>Open video</button><button className="close-dock" onClick={() => setRenderJob(null)}>×</button></div>}
+      {busy === 'Rendering' && renderJob && <div className="render-dock"><div className="render-copy"><span className="eyebrow">{renderMode === 'master' ? 'EXPORTING MASTER' : renderMode === 'rough_preview' ? 'RENDERING ROUGH PREVIEW' : 'RENDERING EFFECTS PREVIEW'}</span><strong>{renderJob.message}</strong></div><div className="progress-track"><i style={{ width: `${Math.round(renderJob.progress * 100)}%` }} /></div><b>{Math.round(renderJob.progress * 100)}%</b><button className="button subtle compact" onClick={() => void cancelRender()}>Cancel</button></div>}
+      {completedRender && <div className="qa-dock"><div><span className={`qa-status ${completedRender.qa.status.toLowerCase()}`}>{completedRender.qa.status}</span><strong>{renderMode === 'master' ? 'Export QA' : 'Preview QA'} {completedRender.state === 'needs_review' ? 'needs review' : 'passed'}</strong><small>{completedRender.qa.checks.filter(item => item.status !== 'PASS').length} notes · {completedRender.output_path}</small></div><button className="button subtle compact" onClick={() => void window.vms.revealLocalFile(completedRender.qa_html)}>Open QA report</button><button className="button compact primary" onClick={() => void window.vms.revealLocalFile(completedRender.output_path)}>Open video</button><button className="close-dock" onClick={() => setRenderJob(null)}>×</button></div>}
 
       <footer className="statusbar"><span><i className="status-led" />LOCAL PROJECT · MEDIA STAYS ON THIS DEVICE</span><span>{project.sources.length} SOURCE{project.sources.length === 1 ? '' : 'S'} <b>·</b> {project.events.length} EVENTS <b>·</b> {project.timeline.length} CLIPS</span><span>SMOOTH / CLEAN <b>·</b> {selectedFPS} FPS <b>·</b> 2560 × 1440</span></footer>
     </div>
@@ -484,7 +633,7 @@ function DirectorPanel(props: { aiState: AIState | null; aiCanPlan: boolean; aiC
     {aiState?.modelCatalog.status === 'error' && <div className="ai-model-error">{aiState.modelCatalog.message ?? 'Model list is temporarily unavailable.'}</div>}
     <div className="data-consent"><label className="check-row"><input type="checkbox" checked={aiConsent} onChange={e => setAIConsent(e.target.checked)}/><span>I agree to send only structured event ranges, tags, beat candidates and render settings to ChatGPT. Video, audio, screenshots, filenames and file paths stay local.</span></label></div>
     <div className="director-actions"><button className="button rule-button" onClick={props.onGenerateRule} disabled={!project.events.length || Boolean(busy)}>◈ Generate rule-only draft <small>OFFLINE · LOCAL</small></button><button className="button primary full" onClick={props.onGenerateAI} disabled={!aiCanPlan || !aiConsent || !project.events.length || Boolean(busy)}>✦ Generate with ChatGPT</button><button className="button subtle full" onClick={props.onTest} disabled={!aiCanPlan || Boolean(busy)}>Test subscription connection</button><small className="disclosure">Requests start only when you click. Review and accept drafts before they change the timeline.</small></div>
-    {proposal && <div className="proposal-card"><div className="proposal-head"><span className={`proposal-source ${proposal.source}`}>{proposal.source === 'chatgpt' ? 'CHATGPT DRAFT' : 'RULE-ONLY DRAFT'}</span><span>{Math.round(proposal.confidence * 100)}% confidence</span></div><h3>{proposal.selected_event_ids.length} highlights · {proposal.beat_targets.length} beat targets</h3><div className="proposal-list">{[...proposal.clip_plans].sort((a, b) => a.slot - b.slot).slice(0, 7).map((plan, index) => <div key={plan.event_id}><span>{String(index + 1).padStart(2, '0')}</span><strong>{project.events.find(event => event.event_id === plan.event_id)?.tags.join(' · ') || 'Manual highlight'}</strong><small>{((plan.out_us - plan.in_us) / 1_000_000).toFixed(1)}s</small></div>)}</div><ul>{proposal.rationale.slice(0, 3).map((line, index) => <li key={index}>{line}</li>)}{proposal.warnings.map((line, index) => <li className="warning-copy" key={`w${index}`}>{line}</li>)}</ul><div className="proposal-buttons"><button className="button subtle compact" onClick={props.onReject}>Reject</button><button className="button primary compact" onClick={props.onAccept}>Accept draft</button></div></div>}
+    {proposal && <div className="proposal-card"><div className="proposal-head"><span className={`proposal-source ${proposal.source}`}>{proposal.source === 'chatgpt' ? 'CHATGPT DRAFT' : 'RULE-ONLY DRAFT'}</span><span>{Math.round(proposal.confidence * 100)}% confidence</span></div><h3>{proposal.selected_event_ids.length} impacts · {proposal.clip_plans.length} sequences · {proposal.beat_targets.length} beat targets</h3><div className="proposal-list">{[...proposal.clip_plans].sort((a, b) => a.slot - b.slot).slice(0, 7).map((plan, index) => <div key={plan.event_id}><span>{String(index + 1).padStart(2, '0')}</span><strong>{(plan.included_event_ids?.length ?? 1) > 1 ? `Multikill · ${plan.included_event_ids!.length} impacts` : project.events.find(event => event.event_id === plan.event_id)?.tags.join(' · ') || 'Manual highlight'}</strong><small>{((plan.out_us - plan.in_us) / 1_000_000).toFixed(1)}s</small></div>)}</div><ul>{proposal.rationale.slice(0, 3).map((line, index) => <li key={index}>{line}</li>)}{proposal.warnings.map((line, index) => <li className="warning-copy" key={`w${index}`}>{line}</li>)}</ul><div className="proposal-buttons"><button className="button subtle compact" onClick={props.onReject}>Reject</button><button className="button primary compact" onClick={props.onAccept}>Accept draft</button></div></div>}
     <div className="director-footnote"><span className="shield">◈</span><p>Metadata-only planning. No automatic background requests. Local rules remain available if ChatGPT is offline or its usage allowance is unavailable.</p></div>
   </div>;
 }
