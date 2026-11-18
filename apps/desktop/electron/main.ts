@@ -2,13 +2,13 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
 import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { app, BrowserWindow, dialog, ipcMain, protocol, safeStorage, shell } from 'electron';
 import { CHATGPT_USAGE_URL, ChatGPTError, createChatGPT, type ChatGPTClient,
   type ChatGPTModel, type LoginProfile, type SessionState } from '@siwc/local';
-import type { AIState, AIDraftResult, KillCandidate, RenderJob, WorkerState } from '../shared/bridge.js';
+import type { AIState, AIDraftResult, KillCandidate, ReferenceDraft, RenderJob, WorkerState } from '../shared/bridge.js';
 import { rebuildTimeline, type Project } from '../shared/project.js';
 import { validateAIProposal } from '../shared/director.js';
 import { createElectronCredentialEncryption } from './credential-encryption.js';
@@ -451,6 +451,25 @@ function setupIpc(): void {
     if (!source || typeof source.media_id !== 'string' || typeof source.path !== 'string') throw new Error('Invalid source selected for kill review.');
     return workerRequest<{ candidates: KillCandidate[]; upstream_commit: string; status: string }>(
       'POST', '/v1/events/detect', { source_media_id: source.media_id, path: source.path }, 60 * 60_000);
+  });
+
+  ipcMain.handle('vms:reference-draft', async (event, project: Project) => {
+    assertRenderer(event);
+    return workerRequest<ReferenceDraft>('POST', '/v1/reference/draft', { project }, 4 * 60 * 60_000);
+  });
+
+  ipcMain.handle('vms:reference-read', async (event, project: Project) => {
+    assertRenderer(event);
+    return workerRequest<ReferenceDraft>('POST', '/v1/reference/read', { project });
+  });
+
+  ipcMain.handle('vms:select-style-reference', async (event) => {
+    assertRenderer(event);
+    const selection = await dialog.showOpenDialog(trustedWindow(), {
+      title: 'Select a visual reference', properties: ['openFile'], filters: VIDEO_FILTERS,
+    });
+    const path = selection.filePaths[0];
+    return selection.canceled || !path ? null : { path, filename: basename(path) };
   });
 
   ipcMain.handle('vms:import-music', async (event) => {

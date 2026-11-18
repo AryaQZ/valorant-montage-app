@@ -3,7 +3,7 @@ AI Editing for Valorant
 
 ## VALORANT Montage Studio
 
-VALORANT Montage Studio is a local-first Windows desktop editor for turning recorded gameplay into a reviewable montage. Its working baseline supports manual highlight annotation, a non-destructive clip timeline, local music analysis, rule-only and optional ChatGPT subscription edit suggestions, autosave, export, and post-render QA. **Kill detection is a manual baseline; the app does not claim automatic kill detection.**
+VALORANT Montage Studio is a local-first Windows desktop editor for turning recorded gameplay into a reviewable montage. It supports manual highlight annotation, locally detected shot candidates, a clip timeline, music analysis, optional ChatGPT planning, autosave, export, and post-render QA.
 
 ## Windows requirements
 
@@ -29,7 +29,19 @@ The installer is written to `apps/desktop/release`. The installed app still need
 
 To use the app, run `VALORANT-Montage-Studio-0.1.0-Windows-x64.exe` from that release folder and follow the installer. This build is unsigned; Windows may show its normal unknown-publisher prompt.
 
-## First edit
+## Automatic montage with the upstream engine
+
+1. Run `scripts\setup-upstream.ps1` once to prepare the local Python 3.11/RIFE runtime. Launch the studio from the Desktop shortcut or the packaged executable.
+2. Import gameplay and a licensed song. With an empty highlight list, **Generate draft** scans the imported recordings for verifiable shots. With existing highlights, it uses verified player highlights in timeline order, or in the highlight list order if the timeline is empty.
+3. Review the takes, musical hit times, and source shots in **Director**. Use **Edit highlight selection** to review and change which shots enter the plan and in what order, then generate again. Upstream computes speed and effect timing on each pass.
+4. Choose **Export montage**, confirm the footage and song rights, and select a new MP4 filename. This route uses the upstream 1920×1080, 60 FPS profile, real RIFE preparation, the reference visual and audio engines, and the upstream QA gate.
+5. Review the video and its QA report. A warning means at least one check needs review. A failed check does not count as an accepted master.
+
+For a replay with missing ownership colors, open **Find kills** and preview each candidate before adding it. For an ace ending, select the final kill clip and review its source. Use **Mark final action start** on the approach to the kill and **Mark visible ACE** on the original banner. Studio reserves an action lead-in by default for a marked ACE. The final take starts with a clear cut, and export QA checks that the encoded approach and impact match the reviewed source. Generate a new draft and check the ACE cue in Director before exporting.
+
+Saved project files reference both the original media and a local draft. If you move the project to another installation, provide the source files and generate a new draft there.
+
+## Manual editing
 
 1. Import one or more recordings. The app reads media metadata and creates local 640×360 preview proxies when FFmpeg is available.
 2. Select a recording and enter the in, impact, and out times for a highlight. Tag the event and confirm player ownership.
@@ -50,8 +62,9 @@ The script runs Python worker tests plus the desktop TypeScript and Vitest check
 
 ## Current limits
 
-- **Manual event baseline:** HUD ROI calibration, OCR/CV kill-feed detection, ownership estimation, multikill clustering from video evidence and detection benchmark reports are not implemented.
-- **Editing:** undo/redo works during the current session. The current editor provides a single gameplay track, fixed Smooth/Clean impact zoom, integer source ranges and drag reordering; speed curves, transitions, cross-project undo history and multitrack editing are not implemented.
+- **Highlight review:** upstream detection can propose shots, but ownership and ambiguous footage still require review.
+- **Editing:** the manual timeline supports clip ordering, trims and clip effects. For the upstream draft, highlight selection and order can be changed before replanning. Direct keyframe edits, manual reverse segments, and legacy effect controls do not flow into upstream exports yet.
+- **Upstream profile:** 1080p60 is the active profile. The manual 1440p144 export remains available in the original engine and is a separate path.
 - **Rendering:** software H.264 (`libx264`) is the supported path. Hardware encoding is not offered until it can be smoke-tested. FFmpeg/FFprobe must be installed separately and available on `PATH`.
 - **SIWC:** the official local DevKit runs in Electron's main process and stores credentials using Electron `safeStorage`. Model discovery is account-scoped. The actual sign-in, app eligibility and inference result still need to be confirmed with the user's ChatGPT account; availability and usage limits are controlled by OpenAI. There is no API-key billing fallback.
 - **Commercial use:** the vendored Sign in with ChatGPT DevKit is under OpenAI's Noncommercial License 1.0. This build and its DevKit integration are restricted to noncommercial purposes unless OpenAI grants separate written permission. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

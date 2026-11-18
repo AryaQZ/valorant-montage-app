@@ -19,6 +19,7 @@ from .jobs import JobManager
 from .library import index_project, list_projects
 from .media import MediaToolError, create_preview_assets, find_media_tools, probe_audio, probe_media
 from .render import preflight
+from .reference import create_reference_draft, read_reference_draft, reference_preflight
 from .schema import ProjectValidationError, validate_project
 from .upstream import capabilities as upstream_capabilities, detect_kills
 
@@ -97,9 +98,15 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 counts = index_project(body.get("project"), body.get("json_path"))
                 self._json(200, {"indexed": True, "counts": counts})
             elif route == "/v1/render/preflight":
-                self._json(200, preflight(body["project"], body["output_path"],
+                project = body["project"]
+                check = reference_preflight if project.get("reference_draft") else preflight
+                self._json(200, check(validate_project(project), body["output_path"],
                                           bool(body.get("rights_acknowledged")),
                                           bool(body.get("ownership_acknowledged"))))
+            elif route == "/v1/reference/draft":
+                self._json(200, create_reference_draft(body["project"]))
+            elif route == "/v1/reference/read":
+                self._json(200, read_reference_draft(validate_project(body["project"])))
             elif route == "/v1/render":
                 job = self.server.jobs.submit_render(body)
                 self._json(202, job)

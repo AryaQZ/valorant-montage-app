@@ -97,6 +97,8 @@ export interface TimelineClip {
 }
 
 export interface Project {
+  reference_draft?: string;
+  reference_video?: { path: string; filename: string } | null;
   schema_version: 2;
   project_id: string;
   name: string;

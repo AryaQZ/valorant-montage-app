@@ -9,6 +9,8 @@ from typing import Any
 import uuid
 
 from .render import render_montage
+from .reference import render_reference
+from .schema import validate_project
 
 
 def _now() -> str:
@@ -58,13 +60,21 @@ class JobManager:
     def _run(self, job_id: str, signal: CancelSignal, body: dict[str, Any]) -> None:
         self._update(job_id, status="running", message="Memulai render")
         try:
-            result = render_montage(body["project"], body["output_path"],
+            progress = lambda value, message: self._update(job_id, progress=value, message=message)
+            project = body["project"]
+            if project.get("reference_draft"):
+                if body.get("render_mode", "master") != "master":
+                    raise ValueError("Draft upstream hanya mendukung export native 1080p60.")
+                result = render_reference(validate_project(project), body["output_path"],
+                                          bool(body.get("rights_acknowledged")),
+                                          bool(body.get("ownership_acknowledged")), signal, progress)
+            else:
+                result = render_montage(project, body["output_path"],
                                     rights_acknowledged=bool(body.get("rights_acknowledged")),
                                     ownership_acknowledged=bool(body.get("ownership_acknowledged")),
                                     cancel_event=signal,
                                     render_mode=str(body.get("render_mode", "master")),
-                                    progress=lambda value, message: self._update(job_id, progress=value,
-                                                                                 message=message))
+                                    progress=progress)
             self._update(job_id, status="complete" if result["state"] == "complete" else "needs_review",
                          progress=1.0, message=result["state"], result=result)
         except InterruptedError as exc:

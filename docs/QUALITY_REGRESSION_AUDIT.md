@@ -1,6 +1,6 @@
 # VALORANT Montage Studio quality regression audit
 
-**Status: investigation and guard repairs complete; upstream render reproduced; application quality restoration is still incomplete.** The app's production renderer does not yet call the upstream timeline planner or full render/audio pipeline, so the upstream render below is a verified reference, not an app-integrated replacement.
+This report describes the application before the native export integration. See [Native upstream export](NATIVE_UPSTREAM_EXPORT.md) for the current route, validation, and remaining limits.
 
 ## Inputs and reproduction
 

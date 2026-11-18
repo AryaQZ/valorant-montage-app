@@ -126,32 +126,30 @@ def _run(python: str, script: Path, args: list[str], cwd: Path, timeout: int,
 
 
 def _run_upstream_cancellable(python: str, script: Path, args: list[str], cwd: Path, timeout: int,
-                              cancel_event: Any = None) -> str:
+                              cancel_event: Any = None, *, allow_nonzero: bool = False) -> str:
     env = dict(os.environ)
     env.setdefault("RIFE_MODEL", str(UPSTREAM_MODEL))
     env.setdefault("RIFE_GPU", _rife_gpu_index())
     env.setdefault("VMS_UPSTREAM_ROOT", str(UPSTREAM_ROOT))
+    env.pop("ACCEPT", None)
+    env["PYTHONIOENCODING"] = "utf-8"
     log_path = cwd / f"{script.stem}.log"
     process: subprocess.Popen[bytes] | None = None
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError(f"Tahap upstream {script.name} dibatalkan.")
         with log_path.open("wb") as log:
             process = subprocess.Popen([python, str(script), *args], cwd=cwd, env=env,
-                                       stdout=log, stderr=subprocess.STDOUT)
-            if cancel_event is not None and hasattr(cancel_event, "attach_process"):
-                cancel_event.attach_process(process)
+                                       stdout=log, stderr=subprocess.STDOUT,
+                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                                       start_new_session=os.name != "nt")
             deadline = time.monotonic() + timeout
             while process.poll() is None:
                 if cancel_event is not None and cancel_event.is_set():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
+                    _stop_upstream_process(process)
                     raise InterruptedError(f"Tahap upstream {script.name} dibatalkan.")
                 if time.monotonic() >= deadline:
-                    process.kill()
-                    process.wait(timeout=5)
+                    _stop_upstream_process(process)
                     raise MediaToolError(f"Tahap upstream {script.name} melewati batas {timeout // 60} menit.")
                 time.sleep(0.2)
     except InterruptedError:
@@ -161,10 +159,31 @@ def _run_upstream_cancellable(python: str, script: Path, args: list[str], cwd: P
     except OSError as exc:
         raise MediaToolError(f"Tidak dapat menjalankan tahap upstream {script.name}: {type(exc).__name__}.") from exc
     output = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
-    if process is None or process.returncode != 0:
+    if process is None or (process.returncode != 0 and not allow_nonzero):
         detail = "\n".join(output.splitlines()[-12:]).strip()
         raise MediaToolError(f"Pipeline upstream {script.name} gagal ({None if process is None else process.returncode}). {detail[-1800:]}")
     return output
+
+
+def _stop_upstream_process(process: subprocess.Popen) -> None:
+    # Upstream Python stages can have FFmpeg running under them.
+    if os.name == "nt":
+        taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
+        try:
+            subprocess.run([str(taskkill), "/PID", str(process.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                           creationflags=subprocess.CREATE_NO_WINDOW, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        import signal
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        process.kill()
+    process.wait(timeout=5)
 
 
 def _normalize_vfr_source(source_path: Path, source_digest: str, *, cancel_event: Any = None) -> tuple[Path, int, str] | None:
@@ -232,12 +251,13 @@ def _nearest_source_frame(timestamps: list[float], time_us: int, fallback_frame:
     return nearest, "ffprobe_packet_pts"
 
 
-def detect_kills(path_value: str, source_media_id: str, duration_us: int) -> dict[str, Any]:
+def detect_kills(path_value: str, source_media_id: str, duration_us: int | None) -> dict[str, Any]:
     """Run original Valorant feed/shot detection and return review-only event candidates."""
     python = upstream_python()
     if not python:
         raise MediaToolError("Deteksi upstream memerlukan Python 3.11 dengan NumPy, OpenCV, dan SciPy. Jalankan scripts/setup-upstream.ps1.")
     media = probe_media(path_value, sample_vfr=False)
+    duration_us = min(duration_us, media["duration_us"]) if duration_us is not None else media["duration_us"]
     path = Path(media["path"])
     stat = path.stat()
     cache_key = hashlib.sha256(f"{path}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")).hexdigest()[:24]
@@ -258,6 +278,11 @@ def detect_kills(path_value: str, source_media_id: str, duration_us: int) -> dic
         ingest = json.loads((work / "src" / "ingest.json").read_text(encoding="utf-8"))["c1"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise MediaToolError("Pipeline upstream tidak menghasilkan kills.json atau ingest.json yang valid.") from exc
+    if not detections and (work / "rows_other.json").is_file():
+        rejected = json.loads((work / "rows_other.json").read_text(encoding="utf-8"))
+        if any(row.get("why") == "other player" for row in rejected.get("c1", [])):
+            _run(python, Path(__file__).with_name("replay_scan.py"), [str(UPSTREAM_SCRIPTS)], work, 3600)
+            detections = json.loads((work / "kills.json").read_text(encoding="utf-8"))
     verification: dict[str, Any] = {}
     ranked: dict[str, Any] = {}
     if detections:
@@ -387,7 +412,9 @@ def detect_kills(path_value: str, source_media_id: str, duration_us: int) -> dic
             "verified_by_upstream": verified_on_frame,
             "suggested_tags": suggested_tags,
             "requires_user_review": True,
+            "requires_ownership_review": bool(item.get("review_ownership")),
             "evidence": [{"type": "upstream_kill_candidate", "upstream_commit": UPSTREAM_COMMIT,
+                          "requires_ownership_review": bool(item.get("review_ownership")),
                           "game": "valorant", "shot_method": str(item.get("how", item.get("method", "unknown"))),
                           "feed_frame": item.get("feed"), "upstream_verified": verified_on_frame,
                           "working_frame_60": item["K"], "original_working_frame_60": old_k,

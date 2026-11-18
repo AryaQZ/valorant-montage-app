@@ -116,6 +116,19 @@ def validate_project(project: dict[str, Any], *, require_timeline: bool = False)
         raise ProjectValidationError("project_id harus berisi 8-80 karakter huruf, angka, atau tanda hubung.")
     if not isinstance(project.get("name"), str) or not project["name"].strip():
         raise ProjectValidationError("Nama project wajib diisi.")
+    if "reference_draft" in project and (
+        not isinstance(project["reference_draft"], str) or not re.fullmatch("[a-f0-9]{32}", project["reference_draft"])
+    ):
+        raise ProjectValidationError("ID draft upstream tidak valid.")
+    reference_video = project.get("reference_video")
+    if reference_video is not None and (
+        not isinstance(reference_video, dict)
+        or not isinstance(reference_video.get("path"), str)
+        or not reference_video["path"].strip()
+        or not isinstance(reference_video.get("filename"), str)
+        or not reference_video["filename"].strip()
+    ):
+        raise ProjectValidationError("Referensi gaya harus menautkan satu file video lokal.")
     settings = project.get("settings")
     if not isinstance(settings, dict):
         raise ProjectValidationError("settings wajib berupa object.")

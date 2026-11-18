@@ -1,6 +1,6 @@
 {
   "name": "valorant-montage-studio",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "VALORANT Montage Studio contributors",
   "private": true,
   "description": "Local-first VALORANT montage editor with optional ChatGPT subscription planning",

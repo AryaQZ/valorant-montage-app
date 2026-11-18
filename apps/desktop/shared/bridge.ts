@@ -1,5 +1,5 @@
 import type { ChatGPTModel, LoginProfile, SessionState } from '@siwc/local';
-import type { MediaSource, Project, DirectorProposal, MusicTrack } from './project.js';
+import type { MediaSource, Project, DirectorProposal, HighlightEvent, MusicTrack } from './project.js';
 
 export interface MediaToolsState {
   available: boolean;
@@ -38,6 +38,7 @@ export interface KillCandidate {
   verified_by_upstream: boolean;
   suggested_tags: string[];
   requires_user_review: true;
+  requires_ownership_review?: boolean;
   evidence: Array<Record<string, unknown>>;
 }
 
@@ -69,12 +70,53 @@ export interface RenderJob {
 
 export interface SaveResult { path: string; }
 export interface AIDraftResult { proposal: DirectorProposal; usageCount: number; }
+export interface ReferenceDraft {
+  id: string;
+  frames: number;
+  fps: number;
+  music_offset_us: number;
+  sources: Record<string, string>;
+  source_ids: Record<string, string>;
+  auto_selected: boolean;
+  rhythm?: {
+    mode: 'regular_drums' | 'measured_attacks';
+    drum?: 'snare' | 'kick';
+    beat_spacing?: number;
+    reason?: 'continuous_engagement' | 'no_audible_regular_run';
+    selected_count: number;
+    measured_count: number;
+  };
+  final_action?: { source_alias: string; source_time_us: number; start_frame: number; action_frame: number; shot_frame: number };
+  ending_confirmation?: { kind: 'ace'; source_alias: string; source_time_us: number; output_frame: number; frames_before_fade: number };
+  planning_notices?: string[];
+  visual_reference?: { filename: string; duration_s: number } | null;
+  selection: HighlightEvent[];
+  takes: Array<{
+    source_alias: string;
+    start_frame: number;
+    end_frame: number;
+    transition: string;
+    impacts: Array<{
+      shot_frame: number;
+      beat_time_us: number;
+      source_time_us: number;
+      setup_frame?: number;
+      confirmation_frame?: number;
+      beat_number?: number;
+      attack?: { kind: 'snare' | 'kick' | 'hat'; strength: number; song_time_us: number } | null;
+    }>;
+    anchors: Array<{ output_frame: number; source_us: number }>;
+  }>;
+}
 
 export interface VMSBridge {
   getWorkerState(): Promise<WorkerState>;
   importRecordings(): Promise<MediaSource[]>;
   detectKills(source: MediaSource): Promise<{ candidates: KillCandidate[]; upstream_commit: string; status: string }>;
+  generateReferenceDraft(project: Project): Promise<ReferenceDraft>;
+  readReferenceDraft(project: Project): Promise<ReferenceDraft>;
   importMusic(): Promise<MusicTrack | null>;
+  selectStyleReference(): Promise<NonNullable<Project['reference_video']> | null>;
   saveProject(project: Project, currentPath?: string | null): Promise<SaveResult | null>;
   loadProject(): Promise<{ project: Project; path: string } | null>;
   autosaveProject(project: Project): Promise<{ path: string }>;

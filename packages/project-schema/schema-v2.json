@@ -6,6 +6,15 @@
   "required": ["schema_version", "project_id", "name", "settings", "sources", "events", "timeline", "music"],
   "properties": {
     "schema_version": {"const": 2},
+    "reference_draft": {"type": "string", "pattern": "^[a-f0-9]{32}$"},
+    "reference_video": {
+      "type": ["object", "null"],
+      "required": ["path", "filename"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "filename": {"type": "string", "minLength": 1}
+      }
+    },
     "project_id": {"type": "string", "minLength": 8, "maxLength": 80},
     "name": {"type": "string", "minLength": 1},
     "created_utc": {"type": "string"},
