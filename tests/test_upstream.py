@@ -93,7 +93,7 @@ class UpstreamDetectionTests(unittest.TestCase):
 
             candidate = result["candidates"][0]
             self.assertTrue(candidate["verified_by_upstream"])
-            self.assertEqual(candidate["suggested_tags"], ["headshot", "multikill"])
+            self.assertEqual(candidate["suggested_tags"], ["headshot"])
             self.assertEqual(candidate["source_time_us"], 5_000_000)
             evidence = candidate["evidence"][0]
             self.assertEqual(evidence["shot_verification"]["verdict"], "verified")

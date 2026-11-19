@@ -125,6 +125,15 @@ class ReferenceDraftTests(TestCase):
             self.assertIn("timeline berubah", reference.reference_preflight(project, str(output), True, True)["errors"][0])
 
 class NativeStyleTests(TestCase):
+    def test_native_fingerprint_survives_javascript_integral_number_serialization(self):
+        project = new_project()
+        project["settings"]["gameplay_gain"] = 1.0
+        before = reference._fingerprint(project, native_style=True, canonical=True)
+        project["settings"]["gameplay_gain"] = 1
+        self.assertEqual(reference._fingerprint(project, native_style=True, canonical=True), before)
+        project["settings"]["gameplay_gain"] = 0.99
+        self.assertNotEqual(reference._fingerprint(project, native_style=True, canonical=True), before)
+
     def test_one_matching_new_attack_per_kill(self):
         rows = [[key, 0.1, 0.8, 0.2] for key in (8, 12, 16, 20)]
         attacks = {key: {"mid": key / 3 + 0.02} for key, *_ in rows}
@@ -176,3 +185,4 @@ class NativeStyleTests(TestCase):
         self.assertEqual(entry_transition(1.0, True, "broll", 1), ("cut", 0.0))
         self.assertEqual(entry_transition(11.0, True, "cut", 2), ("broll", 0.0, -1))
         self.assertEqual(entry_transition(11.0, False, "cut", 2), ("bwhip", 0.0, -1))
+        self.assertEqual(entry_transition(6.4, False, "bwhip", 2), ("bwhip", 0.0, -1))

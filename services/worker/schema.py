@@ -163,6 +163,15 @@ def validate_project(project: dict[str, Any], *, require_timeline: bool = False)
             _require_int(duration_us, f"source {media_id}.duration_us", 1)
         source_by_id[media_id] = source
 
+    dismissed = project.get("dismissed_kill_candidates", [])
+    if not isinstance(dismissed, list):
+        raise ProjectValidationError("Kandidat kill yang diabaikan harus berupa array.")
+    for item in dismissed:
+        if not isinstance(item, dict) or not isinstance(item.get("source_media_id"), str) or item["source_media_id"] not in source_by_id:
+            raise ProjectValidationError("Kandidat kill yang diabaikan merujuk ke rekaman yang tidak dikenal.")
+        _require_int(item.get("source_time_us"), "Waktu kandidat kill yang diabaikan")
+        _require_int(item.get("source_frame"), "Frame kandidat kill yang diabaikan")
+
     event_by_id: dict[str, dict[str, Any]] = {}
     for event in events:
         if not isinstance(event, dict) or not isinstance(event.get("event_id"), str):

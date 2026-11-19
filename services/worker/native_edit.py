@@ -78,8 +78,6 @@ def entry_transition(motion, prefer_roll, previous, index):
     sign = 1 if index % 2 else -1
     if motion >= 8 and prefer_roll and previous != "broll":
         return "broll", 0.0, sign
-    if previous == "bwhip":
-        return "cut", 0.0
     return "bwhip", 0.0, sign
 
 
@@ -304,6 +302,7 @@ def _native_pre_shot_frames(picture):
 
 def _render(output):
     import render as picture
+    import syncaudit
 
     # A straight cut also removes the outgoing two-frame zoom/colour split.
     direct_entries = {picture.CUTF[i] for i, take in enumerate(picture.SEGS)
@@ -316,7 +315,38 @@ def _render(output):
     cam, look = picture.cam, picture.look
     burst, rays = picture.impact_burst, picture.impact_rays
     protected = _native_pre_shot_frames(picture)
-    protected_window = {frame + relative: relative for frame in protected for relative in range(-2, 4)}
+    # Keep the normal impact treatment unless an identifiable source flash
+    # appears early under that treatment. In that case keep the camera stable
+    # through the shot while preserving the RGB split.
+    readable_hits = set(protected)
+    for take, frames in zip(picture.SEGS, picture.KILLF):
+        for (beat, level), hit in zip(take["kills"], frames):
+            if level >= 3 or hit in protected or hit < 4 or hit + 3 >= picture.T.N_FRAMES:
+                continue
+            template, why = syncaudit.flash_template(take["clip"], take["map"], beat, (0, picture.SRC_W))
+            if template is None:
+                continue
+            images = {}
+            for number in range(hit - 4, hit + 4):
+                rgb = picture.render_frame(number, store)
+                gray = picture.cv2.cvtColor(rgb, picture.cv2.COLOR_RGB2GRAY)
+                images[number] = picture.cv2.resize(gray, (192, 108),
+                    interpolation=picture.cv2.INTER_AREA).astype(picture.np.float32)
+
+            def diff(number):
+                if number in images and number - 1 in images:
+                    return picture.np.maximum(images[number] - images[number - 1], 0)
+                return None
+
+            flash = syncaudit.flash_score(template, why, hit, diff)["flash"]
+            if flash is not None and flash < hit:
+                readable_hits.add(hit)
+    protected_window = {}
+    for hit in sorted(readable_hits):
+        for relative in range(-2, 4 if hit in protected else 3):
+            number = hit + relative
+            if number not in protected_window or abs(relative) < abs(protected_window[number]):
+                protected_window[number] = relative
     print(f"Original pre-impact frames used at: {sorted(protected)}", flush=True)
     frame = -1
 
@@ -328,7 +358,20 @@ def _render(output):
     def camera(take, number):
         if number in protected_window:
             return (*picture.SEGS[take]["view"], 0)
-        return cam(take, number)
+        z, x, y, tilt = cam(take, number)
+        # Lead a fast entry out of very slow footage with the same whip direction.
+        # This keeps the lead-in moving as the source motion comes to a stop.
+        if take + 1 < len(picture.SEGS):
+            incoming = picture.SEGS[take + 1]["tin"]
+            remaining = picture.CUTF[take + 1] - number
+            if incoming[0] == "bwhip" and 0 < remaining < 8:
+                speed = float(picture.SEGS[take]["map"](picture.T.frame_beat(number))[1])
+                if speed < 0.35:
+                    phase = (8 - remaining) / 7
+                    strength = min(1.0, picture.BI)
+                    z *= 1 + 0.045 * strength * phase
+                    x += incoming[2] * picture.SRC_W * 0.018 * strength * phase
+        return z, x, y, tilt
 
     def exposure(take, number):
         if number in protected_window:
@@ -340,7 +383,17 @@ def _render(output):
     store.sample = real_source_sample
     picture.cam = camera
     picture.look = exposure
-    picture.impact_burst = lambda img, i, n: img if n in protected_window else burst(img, i, n)
+    def stable_burst(img, take, number):
+        if number not in protected_window:
+            return burst(img, take, number)
+        zoom = picture.KZ
+        try:
+            picture.KZ = 0
+            return burst(img, take, number)
+        finally:
+            picture.KZ = zoom
+
+    picture.impact_burst = stable_burst
     picture.impact_rays = lambda img, i, n: (img, False) if n in protected_window else rays(img, i, n)
 
     encoder = picture.encoder(output)

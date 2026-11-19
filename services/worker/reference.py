@@ -13,7 +13,7 @@ import re
 import shutil
 import uuid
 
-from .media import MediaToolError, app_data_dir, probe_audio, probe_media
+from .media import MediaToolError, app_data_dir, probe_audio, probe_media, publish_render, render_partial_path
 from .schema import validate_project
 from .upstream import (UPSTREAM_COMMIT, UPSTREAM_SCRIPTS, _count_video_frames,
                        _run_upstream_cancellable, detect_kills, upstream_python)
@@ -27,7 +27,17 @@ def _read(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _fingerprint(project: dict, *, native_style: bool = False) -> str:
+def _canonical_numbers(value: Any) -> Any:
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, dict):
+        return {key: _canonical_numbers(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_canonical_numbers(item) for item in value]
+    return value
+
+
+def _fingerprint(project: dict, *, native_style: bool = False, canonical: bool = False) -> str:
     # UI-only attributes do not affect the render. Editing the set/order of
     # inputs, song, or timeline requires another planning pass.
     data = {key: project.get(key) for key in ("project_id", "events", "timeline", "music")}
@@ -36,6 +46,8 @@ def _fingerprint(project: dict, *, native_style: bool = False) -> str:
         data["reference_video"] = project.get("reference_video")
         data["mix_settings"] = {key: project["settings"].get(key, default) for key, default in (
             ("effects_intensity", 0.45), ("music_gain", 0.18), ("gameplay_gain", 1.0))}
+    if canonical:
+        data = _canonical_numbers(data)
     return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -464,7 +476,8 @@ def create_reference_draft(project: dict) -> dict:
         summary.update(id=plan_id, sources=labels, source_ids={alias: key for key, alias in alias_by_id.items()},
                        auto_selected=not bool(project["events"]), selection=selection)
         _write(work / "summary.json", summary)
-        metadata = {"native_style": True, "fingerprint": _fingerprint(project, native_style=True), "stamps": stamps,
+        metadata = {"native_style": True, "fingerprint_version": 2,
+                    "fingerprint": _fingerprint(project, native_style=True, canonical=True), "stamps": stamps,
                     "timeline_sha1": hashlib.sha1((work / "timeline.py").read_bytes()).hexdigest()}
         _write(work / "draft.json", metadata)
         return summary
@@ -485,7 +498,8 @@ def _load_reference(project: dict) -> tuple[Path, dict, dict]:
         timeline_hash = hashlib.sha1((work / "timeline.py").read_bytes()).hexdigest()
     except OSError as exc:
         raise MediaToolError("Draft upstream atau media sumber tidak ditemukan. Buat draft baru setelah memeriksa file.") from exc
-    if (metadata["fingerprint"] != _fingerprint(project, native_style=bool(metadata.get("native_style")))
+    if (metadata["fingerprint"] != _fingerprint(project, native_style=bool(metadata.get("native_style")),
+                                                canonical=metadata.get("fingerprint_version") == 2)
             or stamps != metadata["stamps"] or timeline_hash != metadata["timeline_sha1"]):
         raise MediaToolError("Input atau timeline berubah sejak draft upstream dibuat. Buat draft baru.")
     return work, metadata, summary
@@ -520,7 +534,7 @@ def read_reference_draft(project: dict) -> dict:
 
 
 def render_reference(project: dict, output_path: str, rights: bool, ownership: bool,
-                     cancel_event, progress) -> dict:
+                     cancel_event, progress, *, partial_token: str | None = None) -> dict:
     report = reference_preflight(project, output_path, rights, ownership)
     if report["errors"]:
         raise MediaToolError(" ".join(report["errors"]))
@@ -530,7 +544,7 @@ def render_reference(project: dict, output_path: str, rights: bool, ownership: b
     if not python or not ffmpeg:
         raise MediaToolError("Runtime upstream/RIFE dan FFmpeg diperlukan.")
     destination = Path(report["output_path"])
-    partial = destination.with_name(f".{uuid.uuid4().hex}.partial.mp4")
+    partial = render_partial_path(destination, partial_token)
 
     def stage(value, name, *args, allow_nonzero=False):
         progress(value, f"Upstream · {name}")
@@ -604,21 +618,12 @@ def render_reference(project: dict, output_path: str, rights: bool, ownership: b
             raise MediaToolError("Output sudah ada.")
         if any(path.exists() for path in (qa_json, qa_html, sidecar)):
             raise MediaToolError("File QA atau project dengan nama output ini sudah ada.")
-        written = []
-        try:
-            for filename, content in ((qa_json, json.dumps(qc, ensure_ascii=False, indent=2)),
-                                      (qa_html, "<meta charset=utf-8><h1>Upstream QA · " + status + "</h1><pre>"
-                                       + html.escape(json.dumps(qc, ensure_ascii=False, indent=2)) + "</pre>"),
-                                      (sidecar, json.dumps({**project, "reference_render": summary},
-                                                           ensure_ascii=False, indent=2))):
-                with filename.open("x", encoding="utf-8") as stream:
-                    written.append(filename)
-                    stream.write(content + "\n")
-            partial.rename(destination)
-        except Exception:
-            for filename in written:
-                filename.unlink(missing_ok=True)
-            raise
+        publish_render(partial, destination, {
+            qa_json: json.dumps(qc, ensure_ascii=False, indent=2) + "\n",
+            qa_html: ("<meta charset=utf-8><h1>Upstream QA · " + status + "</h1><pre>"
+                      + html.escape(json.dumps(qc, ensure_ascii=False, indent=2)) + "</pre>\n"),
+            sidecar: json.dumps({**project, "reference_render": summary}, ensure_ascii=False, indent=2) + "\n",
+        })
         return {"output_path": str(destination), "project_sidecar": str(sidecar), "qa_json": str(qa_json),
                 "qa_html": str(qa_html), "qa": qc, "state": "complete" if status == "PASS" else "needs_review"}
     finally:

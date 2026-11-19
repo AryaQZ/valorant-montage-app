@@ -1,16 +1,19 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { Readable } from 'node:stream';
+import { setTimeout as wait } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { app, BrowserWindow, dialog, ipcMain, protocol, safeStorage, shell } from 'electron';
 import { CHATGPT_USAGE_URL, ChatGPTError, createChatGPT, type ChatGPTClient,
   type ChatGPTModel, type LoginProfile, type SessionState } from '@siwc/local';
-import type { AIState, AIDraftResult, KillCandidate, ReferenceDraft, RenderJob, WorkerState } from '../shared/bridge.js';
-import { rebuildTimeline, type Project } from '../shared/project.js';
+import { AI_EFFORTS, MAX_AI_REQUESTS_PER_PROJECT, supportsAIEffort,
+  type AIEffort, type AIState, type AIDraftResult, type KillCandidate, type ReferenceDraft, type RenderJob, type WorkerState } from '../shared/bridge.js';
+import { rebuildTimeline, type MediaSource, type MusicTrack, type Project } from '../shared/project.js';
 import { validateAIProposal } from '../shared/director.js';
+import { killReviewMetadata, validateKillReview } from '../shared/kill-review.js';
 import { createElectronCredentialEncryption } from './credential-encryption.js';
 import { requestLocalWorker } from './worker-client.js';
 
@@ -23,7 +26,6 @@ app.setName('VALORANT Montage Studio');
 app.setPath('userData', join(app.getPath('appData'), 'VALORANT Montage Studio'));
 
 const APP_ID = 'valorant-montage-studio';
-const MAX_AI_REQUESTS_PER_PROJECT = 5;
 const VIDEO_FILTERS = [{ name: 'Gameplay video', extensions: ['mp4', 'mkv', 'mov', 'm4v', 'webm', 'avi', 'ts', 'mts'] }];
 const AUDIO_FILTERS = [{ name: 'Music and audio', extensions: ['mp3', 'wav', 'm4a', 'aac', 'flac', 'ogg', 'opus', 'wma'] }];
 
@@ -31,6 +33,8 @@ let mainWindow: BrowserWindow | undefined;
 let worker: ChildProcess | undefined;
 let workerPort: number | undefined;
 let workerToken: string | undefined;
+let startingWorker: Promise<void> | undefined;
+let quitting = false;
 let chatgpt: ChatGPTClient | undefined;
 let aiUnsubscribe: (() => void) | undefined;
 let activeAiRequest: AbortController | undefined;
@@ -42,8 +46,12 @@ let aiProfiles: LoginProfile[] = [];
 let aiModels: ChatGPTModel[] = [];
 let aiModelCatalog: AIState['modelCatalog'] = { status: 'idle', models: [] };
 let selectedModel = '';
+let selectedEffort: AIEffort = 'auto';
+let pendingAISettings = Promise.resolve();
 const aiUsage = new Map<string, number>();
 const userApprovedProjectPaths = new Set<string>();
+const pendingAutosaves = new Map<string, Promise<void>>();
+const renderPartials = new Map<string, { owner: ChildProcess; path: string; jobId?: string }>();
 const userApprovedOutputArtifacts = new Set<string>();
 const cacheMediaPaths = new Map<string, string>();
 
@@ -70,15 +78,69 @@ function workerDataDirectory(): string {
 
 async function atomicWrite(path: string, content: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temp, content, { encoding: 'utf8', flag: 'wx' });
-  await rename(temp, path);
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temp, content, { encoding: 'utf8', flag: 'wx' });
+    await rename(temp, path);
+  } catch (error) {
+    await unlink(temp).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function mediaSha256(path: string): Promise<string> {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest('hex');
+}
+
+async function removeInterruptedRender(path: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      await unlink(path);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return true;
+      if (code !== 'EBUSY' && code !== 'EPERM' && code !== 'EACCES') return false;
+      await wait(250);
+    }
+  }
+  return false;
+}
+
+function renderJournal(token: string): string {
+  return join(app.getPath('userData'), 'render-recovery', `${token}.json`);
+}
+
+async function forgetRender(token: string, path: string): Promise<void> {
+  renderPartials.delete(token);
+  if (await removeInterruptedRender(path)) await unlink(renderJournal(token)).catch(() => undefined);
+}
+
+async function recoverInterruptedRenders(): Promise<void> {
+  const dir = dirname(renderJournal('example'));
+  const entries = await readdir(dir).catch(() => []);
+  for (const entry of entries) {
+    if (!/^[a-f0-9-]{36}\.json$/.test(entry)) continue;
+    try {
+      const token = entry.slice(0, -5);
+      const record = JSON.parse(await readFile(join(dir, entry), 'utf8')) as { pid?: number; path?: string };
+      if (!record.pid || !Number.isInteger(record.pid) || record.pid <= 0 || typeof record.path !== 'string'
+        || !isAbsolute(record.path) || basename(record.path) !== `.vms-${token}.partial.mp4`) continue;
+      try { process.kill(record.pid, 0); continue; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') continue; }
+      await forgetRender(token, record.path);
+    } catch { /* An unreadable journal cannot authorize removing a file. */ }
+  }
 }
 
 async function loadLocalSettings(): Promise<void> {
   try {
-    const settings = JSON.parse(await readFile(join(app.getPath('userData'), 'ai-settings.json'), 'utf8')) as { model?: unknown; usage?: unknown };
+    const settings = JSON.parse(await readFile(join(app.getPath('userData'), 'ai-settings.json'), 'utf8')) as { model?: unknown; effort?: unknown; usage?: unknown };
     if (typeof settings.model === 'string') selectedModel = settings.model;
+    const savedEffort = AI_EFFORTS.find(effort => effort === settings.effort);
+    if (savedEffort) selectedEffort = savedEffort;
     if (settings.usage && typeof settings.usage === 'object' && !Array.isArray(settings.usage)) {
       for (const [projectId, count] of Object.entries(settings.usage)) {
         if (typeof count === 'number' && Number.isInteger(count) && count >= 0) aiUsage.set(projectId, count);
@@ -89,7 +151,10 @@ async function loadLocalSettings(): Promise<void> {
 
 async function persistAISettings(): Promise<void> {
   const usage = Object.fromEntries(aiUsage.entries());
-  await atomicWrite(join(app.getPath('userData'), 'ai-settings.json'), JSON.stringify({ model: selectedModel, usage }, null, 2));
+  const json = JSON.stringify({ model: selectedModel, effort: selectedEffort, usage }, null, 2);
+  const write = pendingAISettings.then(() => atomicWrite(join(app.getPath('userData'), 'ai-settings.json'), json));
+  pendingAISettings = write.catch(() => undefined);
+  await write;
 }
 
 function findCredentialWorker(): Promise<void> {
@@ -100,7 +165,7 @@ function findCredentialWorker(): Promise<void> {
     const python = process.env.VMS_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
     const child = spawn(python, ['-m', 'services.worker'], {
       cwd: root,
-      env: { ...process.env, PYTHONPATH: root, VMS_DATA_DIR: workerDataDirectory() },
+      env: { ...process.env, PYTHONPATH: root, VMS_DATA_DIR: workerDataDirectory(), VMS_WORKER_PARENT_PID: String(process.pid) },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -113,14 +178,24 @@ function findCredentialWorker(): Promise<void> {
       if (settled) return;
       settled = true;
       clearTimeout(startupTimeout);
-      if (error) rejectReady(error);
+      if (error) {
+        child.kill();
+        rejectReady(error);
+      }
       else resolveReady();
     };
     child.once('error', (error) => finish(new Error(`Could not launch Python worker: ${error.message}`)));
     child.once('exit', (code) => {
       if (!settled) finish(new Error(`Local worker exited during startup (${code ?? 'unknown'}). Check ${workerLog}`));
-      workerPort = undefined;
-      workerToken = undefined;
+      if (worker === child) {
+        worker = undefined;
+        workerPort = undefined;
+        workerToken = undefined;
+      }
+      for (const [token, partial] of renderPartials) {
+        if (partial.owner !== child) continue;
+        void forgetRender(token, partial.path);
+      }
     });
     let data = '';
     child.stdout.setEncoding('utf8');
@@ -145,11 +220,45 @@ function findCredentialWorker(): Promise<void> {
   }));
 }
 
+function ensureWorker(): Promise<void> {
+  if (quitting) return Promise.reject(new Error('Studio sedang ditutup.'));
+  if (worker && worker.exitCode === null && worker.signalCode === null && workerPort && workerToken) return Promise.resolve();
+  startingWorker ??= findCredentialWorker().finally(() => { startingWorker = undefined; });
+  return startingWorker;
+}
+
 async function workerRequest<T>(method: 'GET' | 'POST' | 'DELETE', route: string, body?: unknown, timeoutMs = 60_000): Promise<T> {
+  await ensureWorker();
   const port = workerPort;
   const token = workerToken;
   if (!worker || worker.exitCode !== null || !port || !token) throw new Error('The local media worker is not connected.');
   return requestLocalWorker<T>({ port, token, method, route, body, timeoutMs });
+}
+
+async function submitRender(body: { output_path: string; project: Project; rights_acknowledged: boolean;
+  ownership_acknowledged: boolean; render_mode?: 'rough_preview' | 'effects_preview' }): Promise<{ job_id: string }> {
+  await ensureWorker();
+  const owner = worker;
+  const port = workerPort;
+  const token = workerToken;
+  if (!owner || !port || !token) throw new Error('Worker media belum terhubung.');
+  const partialToken = randomUUID();
+  const partial = { owner, path: join(dirname(body.output_path), `.vms-${partialToken}.partial.mp4`), jobId: undefined as string | undefined };
+  await atomicWrite(renderJournal(partialToken), JSON.stringify({ pid: process.pid, path: partial.path }));
+  if (owner.exitCode !== null || owner.signalCode !== null) {
+    await forgetRender(partialToken, partial.path);
+    throw new Error('Worker media terputus sebelum render dimulai. Coba lagi.');
+  }
+  renderPartials.set(partialToken, partial);
+  try {
+    const job = await requestLocalWorker<{ job_id: string }>({ port, token, method: 'POST', route: '/v1/render',
+      body: { ...body, partial_token: partialToken } });
+    partial.jobId = job.job_id;
+    return job;
+  } catch (error) {
+    if (owner.exitCode !== null || owner.signalCode !== null) await forgetRender(partialToken, partial.path);
+    throw error;
+  }
 }
 
 function assertRenderer(event: Electron.IpcMainInvokeEvent): void {
@@ -172,7 +281,7 @@ function safeAIError(error: unknown): string {
 
 function makeAIState(): AIState {
   return { session: { ...aiSession }, profiles: [...aiProfiles], modelCatalog: { ...aiModelCatalog, models: [...aiModelCatalog.models] },
-    selectedModel, accountBusy, aiBusy: aiRequestBusy, aiActivity };
+    selectedModel, selectedEffort, accountBusy, aiBusy: aiRequestBusy, aiActivity };
 }
 
 function publishAIState(): void {
@@ -376,7 +485,7 @@ function consumeAIRequest(projectId: string): number {
   if (count >= MAX_AI_REQUESTS_PER_PROJECT) throw new Error(`Per-project ChatGPT request cap reached (${MAX_AI_REQUESTS_PER_PROJECT}). Use the rule-only director or start another project.`);
   const next = count + 1;
   aiUsage.set(projectId, next);
-  void persistAISettings();
+  void persistAISettings().catch(() => undefined);
   return next;
 }
 
@@ -385,20 +494,24 @@ function requireLiveModel(model: string): void {
   if (!aiModels.some(item => item.slug === model)) throw new Error('Selected model is not in the active account catalog. Refresh the model list.');
 }
 
-async function requestChatGPT(model: string, payload: Record<string, unknown>, instructions: string, projectId: string): Promise<{ text: string; count: number }> {
+async function requestChatGPT(model: string, payload: Record<string, unknown>, instructions: string, projectId: string,
+  effort: AIEffort): Promise<{ text: string; count: number }> {
   const runtime = ensureChatGPT();
   requireLiveModel(model);
   const count = consumeAIRequest(projectId);
   const controller = new AbortController();
   activeAiRequest = controller;
+  const reasoningEffort = effort !== 'auto' && supportsAIEffort(model) ? effort : undefined;
+  const timeoutSeconds = reasoningEffort === 'xhigh' || reasoningEffort === 'max' ? 180 : 90;
   let timedOut = false;
-  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 90_000);
+  const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutSeconds * 1000);
   aiRequestBusy = true;
   aiActivity = 'Sending structured metadata to ChatGPT';
   publishAIState();
   try {
     const result = await runtime.streamResponse({
       model,
+      reasoningEffort,
       instructions,
       input: [{ role: 'user', content: JSON.stringify(payload) }],
       signal: controller.signal,
@@ -407,7 +520,7 @@ async function requestChatGPT(model: string, payload: Record<string, unknown>, i
     if (!result.text.trim()) throw new Error('ChatGPT completed without an edit plan.');
     return { text: result.text, count };
   } catch (error) {
-    if (timedOut) throw new Error('ChatGPT request timed out after 90 seconds. You can try again or use the rule-only director.');
+    if (timedOut) throw new Error(`ChatGPT request timed out after ${timeoutSeconds} seconds. You can try again or use the rule-only director.`);
     const message = safeAIError(error);
     aiSession = { ...aiSession, error: { code: error instanceof ChatGPTError ? error.code : 'inference_failed', message, retryable: true } };
     throw new Error(message);
@@ -479,7 +592,7 @@ function setupIpc(): void {
     const path = selection.filePaths[0];
     const metadata = await workerRequest<Record<string, unknown>>('POST', '/v1/music/probe', { path });
     const analysis = await workerRequest<Record<string, unknown>>('POST', '/v1/music/analyze', { path }, 60 * 60_000);
-    return { ...metadata, ...analysis, rights_acknowledged: false, offset_us: 0 };
+    return { ...metadata, ...analysis, file_sha256: await mediaSha256(path), rights_acknowledged: false, offset_us: 0 };
   });
 
   ipcMain.handle('vms:save-project', async (event, project: Project, currentPath?: string | null) => {
@@ -501,30 +614,113 @@ function setupIpc(): void {
     return { path };
   });
 
-  ipcMain.handle('vms:load-project', async (event) => {
+  ipcMain.handle('vms:load-project', async (event, recover = false) => {
     assertRenderer(event);
-    const selection = await dialog.showOpenDialog(trustedWindow(), { title: 'Open montage project', properties: ['openFile'],
+    const autosaveDir = join(app.getPath('userData'), 'autosave');
+    if (recover) await mkdir(autosaveDir, { recursive: true });
+    const selection = await dialog.showOpenDialog(trustedWindow(), { title: recover ? 'Pulihkan autosave proyek' : 'Open montage project',
+      defaultPath: recover ? autosaveDir : undefined, properties: ['openFile'],
       filters: [{ name: 'VMS project JSON', extensions: ['json'] }] });
     if (selection.canceled || !selection.filePaths[0]) return null;
-    const path = selection.filePaths[0];
+    const path = resolve(selection.filePaths[0]);
+    if (recover && (dirname(path) !== resolve(autosaveDir) || !path.endsWith('.vmsproj.json'))) {
+      throw new Error('Pilih file autosave dari folder yang dibuka.');
+    }
     const imported = JSON.parse(await readFile(path, 'utf8')) as Project;
     const validation = await workerRequest<{ project: Project }>('POST', '/v1/project/validate', { project: imported });
     const project = validation.project;
-    userApprovedProjectPaths.add(resolve(path));
+    if (!recover) userApprovedProjectPaths.add(path);
+    const missingMediaPaths: string[] = [];
+    const media = [...project.sources, project.music, project.reference_video];
+    for (const item of media) {
+      if (!item) continue;
+      if (!isAbsolute(item.path)) item.path = resolve(dirname(path), item.path);
+      if (!(await stat(item.path).catch(() => null))?.isFile()) missingMediaPaths.push(item.path);
+    }
     for (const source of project.sources) {
+      if (!missingMediaPaths.includes(source.path)
+        && (!source.proxy_path || !isInsideCache(source.proxy_path) || !existsSync(source.proxy_path))) {
+        try {
+          const assets = await workerRequest<{ proxy_path?: string; thumbnail_path?: string }>(
+            'POST', '/v1/media/import', { path: source.path }, 60 * 60_000);
+          source.proxy_path = assets.proxy_path;
+          source.thumbnail_path = assets.thumbnail_path;
+        } catch { /* Keep the project editable when FFmpeg cannot rebuild its preview. */ }
+      }
       source.preview_url = fileUrlForCache(source.proxy_path);
       source.thumbnail_url = fileUrlForCache(source.thumbnail_path);
     }
-    return { project, path };
+    return { project, path: recover ? null : path, missingMediaPaths };
+  });
+
+  ipcMain.handle('vms:relink-recording', async (event, source: MediaSource) => {
+    assertRenderer(event);
+    const selection = await dialog.showOpenDialog(trustedWindow(), {
+      title: 'Temukan kembali rekaman gameplay', properties: ['openFile'], filters: VIDEO_FILTERS,
+    });
+    if (selection.canceled || !selection.filePaths[0]) return null;
+    const path = selection.filePaths[0];
+    const metadata = await workerRequest<MediaSource>('POST', '/v1/probe', { path });
+    if (metadata.size_bytes !== source.size_bytes || metadata.duration_us !== source.duration_us
+      || metadata.video.width !== source.video.width || metadata.video.height !== source.video.height
+      || metadata.video.codec !== source.video.codec) {
+      throw new Error('File pilihan berbeda dari rekaman proyek. Pilih salinan rekaman aslinya agar waktu kill tetap tepat.');
+    }
+    const assets = await workerRequest<Pick<MediaSource, 'proxy_path' | 'thumbnail_path' | 'warning'>>(
+      'POST', '/v1/media/import', { path }, 60 * 60_000);
+    return { ...metadata, ...assets, media_id: source.media_id, preview_url: fileUrlForCache(assets.proxy_path),
+      thumbnail_url: fileUrlForCache(assets.thumbnail_path) };
+  });
+
+  ipcMain.handle('vms:relink-music', async (event, track: MusicTrack) => {
+    assertRenderer(event);
+    const selection = await dialog.showOpenDialog(trustedWindow(), {
+      title: 'Temukan kembali musik montage', properties: ['openFile'], filters: AUDIO_FILTERS,
+    });
+    const path = selection.filePaths[0];
+    if (selection.canceled || !path) return null;
+    const file = await workerRequest<Pick<MusicTrack, 'path' | 'filename' | 'duration_us' | 'size_bytes'>>('POST', '/v1/music/probe', { path });
+    // Older projects store the decoded analysis length, which can differ
+    // slightly from the container duration because of codec padding.
+    const matches = track.file_sha256
+      ? (await mediaSha256(file.path)) === track.file_sha256
+      : Math.abs(file.duration_us - track.duration_us) <= 100_000
+        && (track.size_bytes == null || file.size_bytes === track.size_bytes);
+    if (!matches) {
+      throw new Error('Pilih salinan lagu asli agar posisi beat dan offset tetap cocok.');
+    }
+    return { path: file.path, filename: file.filename };
+  });
+
+  ipcMain.handle('vms:relink-reference', async (event) => {
+    assertRenderer(event);
+    const selection = await dialog.showOpenDialog(trustedWindow(), {
+      title: 'Temukan kembali video referensi', properties: ['openFile'], filters: VIDEO_FILTERS,
+    });
+    const path = selection.filePaths[0];
+    if (selection.canceled || !path) return null;
+    const video = await workerRequest<Pick<MediaSource, 'path' | 'filename'>>('POST', '/v1/probe', { path });
+    return { path: video.path, filename: video.filename };
   });
 
   ipcMain.handle('vms:autosave-project', async (event, project: Project) => {
     assertRenderer(event);
-    const validation = await workerRequest<{ project: Project }>('POST', '/v1/project/validate', { project });
-    project = validation.project;
+    if (typeof project?.project_id !== 'string' || !/^[a-zA-Z0-9-]{8,80}$/.test(project.project_id)) {
+      throw new Error('ID proyek autosave tidak valid.');
+    }
     const path = join(app.getPath('userData'), 'autosave', `${project.project_id}.vmsproj.json`);
-    await atomicWrite(path, `${JSON.stringify(project, null, 2)}\n`);
-    await workerRequest('POST', '/v1/library/index', { project, json_path: path });
+    const previous = pendingAutosaves.get(path) ?? Promise.resolve();
+    const save = previous.catch(() => undefined).then(async () => {
+      const validation = await workerRequest<{ project: Project }>('POST', '/v1/project/validate', { project });
+      await atomicWrite(path, `${JSON.stringify(validation.project, null, 2)}\n`);
+      await workerRequest('POST', '/v1/library/index', { project: validation.project, json_path: path }).catch(() => undefined);
+    });
+    pendingAutosaves.set(path, save);
+    try {
+      await save;
+    } finally {
+      if (pendingAutosaves.get(path) === save) pendingAutosaves.delete(path);
+    }
     return { path };
   });
 
@@ -543,7 +739,7 @@ function setupIpc(): void {
       ownership_acknowledged: Boolean(acknowledgements?.ownership) };
     const preflight = await workerRequest<{ errors: string[]; warnings: string[]; duration_us: number }>('POST', '/v1/render/preflight', body);
     if (preflight.errors.length) throw new Error(preflight.errors.join('\n'));
-    const job = await workerRequest<{ job_id: string }>('POST', '/v1/render', body);
+    const job = await submitRender(body);
     return { job_id: job.job_id, output_path: outputPath };
   });
 
@@ -552,8 +748,12 @@ function setupIpc(): void {
     assertRenderer(event);
     if (mode !== 'rough_preview' && mode !== 'effects_preview') throw new Error('Preview mode is invalid.');
     const previewProject = structuredClone(project);
-    previewProject.settings.output_profile = mode === 'rough_preview' ? 'preview_30' : 'youtube_60';
-    rebuildTimeline(previewProject);
+    if (previewProject.reference_draft) {
+      if (mode !== 'effects_preview') throw new Error('Gunakan preview dengan efek untuk draft otomatis.');
+    } else {
+      previewProject.settings.output_profile = mode === 'rough_preview' ? 'preview_30' : 'youtube_60';
+      rebuildTimeline(previewProject);
+    }
     const outputPath = join(cacheRoot(), 'previews', `${previewProject.project_id}-${mode}-${Date.now()}.mp4`);
     await mkdir(dirname(outputPath), { recursive: true });
     const body = { project: previewProject, output_path: outputPath,
@@ -561,7 +761,7 @@ function setupIpc(): void {
       ownership_acknowledged: Boolean(acknowledgements?.ownership), render_mode: mode };
     const preflight = await workerRequest<{ errors: string[] }>('POST', '/v1/render/preflight', body);
     if (preflight.errors.length) throw new Error(preflight.errors.join('\n'));
-    const job = await workerRequest<{ job_id: string }>('POST', '/v1/render', body);
+    const job = await submitRender(body);
     const previewUrl = fileUrlForCache(outputPath);
     if (!previewUrl) throw new Error('Preview output could not be mapped into the local cache.');
     return { job_id: job.job_id, output_path: outputPath, preview_url: previewUrl };
@@ -570,7 +770,13 @@ function setupIpc(): void {
   ipcMain.handle('vms:render-job', async (event, jobId: string) => {
     assertRenderer(event);
     if (typeof jobId !== 'string' || !/^[a-f0-9-]{36}$/i.test(jobId)) throw new Error('Invalid render job ID.');
-    return workerRequest<RenderJob>('GET', `/v1/jobs/${jobId}`);
+    const job = await workerRequest<RenderJob>('GET', `/v1/jobs/${jobId}`);
+    if (job.status !== 'running' && job.status !== 'queued') {
+      for (const [token, partial] of renderPartials) {
+        if (partial.jobId === jobId) void forgetRender(token, partial.path);
+      }
+    }
+    return job;
   });
 
   ipcMain.handle('vms:cancel-render', async (event, jobId: string) => {
@@ -612,6 +818,15 @@ function setupIpc(): void {
     if (typeof slug !== 'string' || !aiModels.some(model => model.slug === slug)) throw new Error('Model must be selected from the active account catalog.');
     selectedModel = slug; await persistAISettings(); publishAIState(); return makeAIState();
   });
+  ipcMain.handle('vms:ai-set-effort', async (event, requestedEffort: unknown) => {
+    assertRenderer(event);
+    const effort = AI_EFFORTS.find(value => value === requestedEffort);
+    if (!effort) throw new Error('Pilihan effort AI tidak valid.');
+    selectedEffort = effort;
+    await persistAISettings();
+    publishAIState();
+    return makeAIState();
+  });
   ipcMain.handle('vms:ai-cancel-sign-in', async (event) => { assertRenderer(event); chatgpt?.cancelSignIn(); });
   ipcMain.handle('vms:ai-disconnect', async (event) => {
     assertRenderer(event); ensureChatGPT();
@@ -625,18 +840,32 @@ function setupIpc(): void {
     assertRenderer(event);
     if (aiRequestBusy) throw new Error('Wait for the current ChatGPT request or cancel it.');
     const payload = { test: 'connection_check', app: APP_ID };
-    const result = await requestChatGPT(model, payload, 'Reply with exactly the word OK. Do not call tools.', projectId);
+    const result = await requestChatGPT(model, payload, 'Reply with exactly the word OK. Do not call tools.', projectId, selectedEffort);
     return { text: result.text, usageCount: result.count };
+  });
+  ipcMain.handle('vms:ai-review-kills', async (event, projectId: string, model: string, candidates: KillCandidate[]) => {
+    assertRenderer(event);
+    if (aiRequestBusy) throw new Error('Tunggu sampai permintaan ChatGPT selesai.');
+    const metadata = killReviewMetadata(candidates);
+    const instructions = [
+      'Triage Valorant kill candidates using only the supplied local detector signals. You cannot see the footage.',
+      'Rank candidates by evidence strength, strongest first. Low confidence, an unverified shot, or uncertainty about replay ownership warrants a closer manual check.',
+      'Do not confirm kills, ownership, or timestamps, and do not create or drop candidates.',
+      'Return only JSON: {"reviews":[{"index":0,"priority":"prioritize"}]}. Include each supplied index exactly once. Priority must be "prioritize" or "check_again".',
+    ].join(' ');
+    const result = await requestChatGPT(model, metadata, instructions, projectId, selectedEffort);
+    return { reviews: validateKillReview(parseJsonOnly(result.text), candidates), usageCount: result.count };
   });
   ipcMain.handle('vms:ai-generate-proposal', async (event, project: Project, model: string): Promise<AIDraftResult> => {
     assertRenderer(event);
     if (aiRequestBusy) throw new Error('Wait for the current ChatGPT request or cancel it.');
+    const effort = selectedEffort;
     await workerRequest('POST', '/v1/project/validate', { project });
     const metadata = safeProjectMetadata(project);
     let validationMessage = '';
     let lastCount = aiUsage.get(project.project_id) ?? 0;
     for (let attempt = 0; attempt < 2; attempt++) {
-      const result = await requestChatGPT(model, metadata, aiInstructions(validationMessage || undefined), project.project_id);
+      const result = await requestChatGPT(model, metadata, aiInstructions(validationMessage || undefined), project.project_id, effort);
       lastCount = result.count;
       try {
         const proposal = validateAIProposal(parseJsonOnly(result.text), project);
@@ -689,9 +918,9 @@ async function signInWithChatGPT(options: Parameters<ChatGPTClient['signIn']>[0]
 async function createWindow(): Promise<void> {
   const preloadPath = join(here, '../preload/index.cjs');
   mainWindow = new BrowserWindow({
-    width: 1480, height: 940, minWidth: 1180, minHeight: 740,
+    width: 1480, height: 940, minWidth: 820, minHeight: 620,
     backgroundColor: '#0d1016', show: false,
-    title: 'VALORANT Montage Studio',
+    title: `VALORANT Montage Studio · Versi ${app.getVersion()}`,
     webPreferences: { preload: preloadPath, contextIsolation: true, nodeIntegration: false, sandbox: true,
       webSecurity: true, allowRunningInsecureContent: false, spellcheck: false },
   });
@@ -720,8 +949,9 @@ async function createWindow(): Promise<void> {
 app.whenReady().then(async () => {
   registerCacheMediaProtocol();
   await loadLocalSettings();
+  await recoverInterruptedRenders();
   startChatGPT();
-  await findCredentialWorker();
+  await ensureWorker();
   setupIpc();
   await createWindow();
   void refreshAIState();
@@ -732,9 +962,9 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', () => {
+  quitting = true;
   activeAiRequest?.abort();
   aiUnsubscribe?.();
-  if (worker && worker.exitCode === null) worker.kill();
 });
 
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });

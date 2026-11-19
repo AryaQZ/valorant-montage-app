@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import uuid
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".m4v", ".webm", ".avi", ".ts", ".mts"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wma"}
@@ -182,6 +183,29 @@ def probe_audio(path_value: str) -> dict[str, Any]:
     return {"path": str(path), "filename": path.name, "size_bytes": path.stat().st_size,
             "duration_us": duration_us, "codec": audio.get("codec_name"),
             "sample_rate": audio.get("sample_rate"), "channels": audio.get("channels")}
+
+
+def render_partial_path(destination: Path, token: str | None = None) -> Path:
+    identifier = uuid.UUID(token) if token is not None else uuid.uuid4()
+    return destination.with_name(f".vms-{identifier}.partial.mp4")
+
+
+def publish_render(partial: Path, destination: Path, sidecars: dict[Path, str]) -> None:
+    """Publish a verified render without overwriting any existing project or output."""
+    written = []
+    try:
+        for path, content in sidecars.items():
+            with path.open("x", encoding="utf-8") as stream:
+                written.append(path)
+                stream.write(content)
+        if os.name == "nt":
+            partial.rename(destination)  # Windows refuses to replace an existing destination.
+        else:
+            os.link(partial, destination)
+    except Exception:
+        for path in written:
+            path.unlink(missing_ok=True)
+        raise
 
 
 def _sample_timestamps(path: Path) -> dict[str, Any]:

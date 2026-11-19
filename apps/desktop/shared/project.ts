@@ -29,6 +29,8 @@ export interface MediaSource {
 export interface MusicTrack {
   path: string;
   filename: string;
+  size_bytes?: number;
+  file_sha256?: string;
   duration_us: number;
   bpm_estimate: number | null;
   confidence: number;
@@ -113,6 +115,7 @@ export interface Project {
   };
   sources: MediaSource[];
   events: HighlightEvent[];
+  dismissed_kill_candidates?: Array<Pick<HighlightEvent, 'source_media_id' | 'source_time_us' | 'source_frame'>>;
   timeline: TimelineClip[];
   music: MusicTrack | null;
   director: { mode: 'rule_only' | 'chatgpt'; last_proposal: DirectorProposal | null };
@@ -205,6 +208,20 @@ function remapFrames(sourceStartUs: number, sourceEndUs: number, speedNum: numbe
     speed_num: speedNum, speed_den: speedDen, direction };
 }
 
+export function resizeClipRange(clip: TimelineClip, inUs: number, outUs: number): void {
+  if (inUs === clip.in_us && outUs === clip.out_us) return;
+  const segments = clip.time_remap.flatMap(segment => {
+    const start = Math.max(segment.source_start_us, inUs);
+    const end = Math.min(segment.source_end_us, outUs);
+    return start < end ? [remapFrames(start, end, segment.speed_num, segment.speed_den, segment.direction)] : [];
+  });
+  if (inUs < clip.in_us && inUs < outUs) segments.unshift(remapFrames(inUs, Math.min(clip.in_us, outUs), 1, 1, 'forward'));
+  if (outUs > clip.out_us && inUs < outUs) segments.push(remapFrames(Math.max(clip.out_us, inUs), outUs, 1, 1, 'forward'));
+  clip.in_us = inUs;
+  clip.out_us = outUs;
+  clip.time_remap = segments;
+}
+
 export function makePostKillSpeedRamp(event: HighlightEvent, inUs: number, outUs: number, fps: number): TimelineClip['time_remap'] {
   const slowStart = Math.min(outUs, event.source_time_us + 180_000);
   const slowEnd = Math.min(outUs, event.source_time_us + 1_050_000);
@@ -292,6 +309,84 @@ export function makeClip(project: Project, event: HighlightEvent, inUs = event.i
     time_remap: remap, effects: makeAutomaticEffects(event, intensity), transitions: [], audio_gain: project.settings.gameplay_gain,
   };
   return clip;
+}
+
+export function isAutoKill(event: HighlightEvent): boolean {
+  return event.evidence.some(item => item.type === 'user_reviewed_upstream_candidate');
+}
+
+type SourceKillWindow = Pick<HighlightEvent, 'source_media_id' | 'source_time_us' | 'in_us' | 'out_us'>;
+
+export function isolatedKillWindow(event: SourceKillWindow, neighbors: readonly SourceKillWindow[]): { inUs: number; outUs: number } {
+  const time = event.source_time_us;
+  let before = -Infinity;
+  let after = Infinity;
+  for (const other of neighbors) {
+    if (other.source_media_id !== event.source_media_id) continue;
+    if (other.source_time_us < time) before = Math.max(before, other.source_time_us);
+    if (other.source_time_us > time) after = Math.min(after, other.source_time_us);
+  }
+  // Use a shared cut between neighboring impacts when their replay windows overlap.
+  const inUs = Number.isFinite(before) ? Math.max(event.in_us, Math.ceil((before + time) / 2)) : event.in_us;
+  const outUs = Math.min(event.out_us, Math.ceil(time + (after - time) / 2));
+  return { inUs, outUs };
+}
+
+export function autoKillClipBounds(project: Project, clip: TimelineClip, detected: readonly SourceKillWindow[] = []): { inUs: number; outUs: number } | null {
+  const event = project.events.find(item => item.event_id === clip.event_id);
+  if (!event || !isAutoKill(event) || (clip.included_event_ids?.length ?? 1) > 1) return null;
+  return isolatedKillWindow(event, [...project.events, ...detected]);
+}
+
+export function trimOverlappingAutoKillClips(project: Project, sourceId?: string, detected: readonly SourceKillWindow[] = []): void {
+  for (const clip of project.timeline) {
+    if (sourceId && clip.source_media_id !== sourceId) continue;
+    const bounds = autoKillClipBounds(project, clip, detected);
+    if (!bounds) continue;
+    const inUs = Math.max(clip.in_us, bounds.inUs);
+    const outUs = Math.min(clip.out_us, bounds.outUs);
+    if (inUs >= outUs || (inUs === clip.in_us && outUs === clip.out_us)) continue;
+    resizeClipRange(clip, inUs, outUs);
+  }
+  rebuildTimeline(project);
+}
+
+export function removeReviewedHighlight(project: Project, eventId: string): void {
+  project.events = project.events.filter(event => event.event_id !== eventId);
+  const events = new Map(project.events.map(event => [event.event_id, event]));
+  project.timeline = project.timeline.flatMap(clip => {
+    const ids = clip.included_event_ids ?? [clip.event_id];
+    if (!ids.includes(eventId)) return [clip];
+    const retained = ids.filter(id => id !== eventId).map(id => events.get(id)!);
+    if (!retained.length) return [];
+    if (clip.event_id !== eventId) {
+      clip.included_event_ids = retained.map(event => event.event_id);
+      return [clip];
+    }
+    const firstImpact = Math.min(...retained.map(event => event.source_time_us));
+    const lastImpact = Math.max(...retained.map(event => event.source_time_us));
+    const primary = retained.find(event => event.in_us <= firstImpact && event.out_us >= lastImpact);
+    if (primary) {
+      clip.event_id = primary.event_id;
+      clip.included_event_ids = retained.map(event => event.event_id);
+      const lo = Math.max(clip.in_us, primary.in_us);
+      const hi = Math.min(clip.out_us, primary.out_us);
+      resizeClipRange(clip, lo < hi ? lo : primary.in_us, lo < hi ? hi : primary.out_us);
+      return [clip];
+    }
+    return retained.sort((a, b) => a.source_time_us - b.source_time_us).map((event, index) => {
+      const bounds = isolatedKillWindow(event, retained);
+      const next = { ...structuredClone(clip), clip_id: index === 0 ? clip.clip_id : crypto.randomUUID(),
+        event_id: event.event_id, included_event_ids: [event.event_id] };
+      const lo = Math.max(clip.in_us, bounds.inUs);
+      const hi = Math.min(clip.out_us, bounds.outUs);
+      resizeClipRange(next, lo < hi ? lo : bounds.inUs, lo < hi ? hi : bounds.outUs);
+      return next;
+    });
+  });
+  project.director = { ...project.director, last_proposal: null };
+  delete project.reference_draft;
+  rebuildTimeline(project);
 }
 
 export function applyProposal(project: Project, proposal: DirectorProposal): Project {

@@ -5,10 +5,12 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
+from services.worker.media import publish_render
 from services.worker.render import render_montage
-from services.worker.schema import add_timeline_clip, new_project
+from services.worker.schema import add_timeline_clip, new_project, normalize_timeline
 
 
 def _has_encoder() -> bool:
@@ -20,8 +22,126 @@ def _has_encoder() -> bool:
     return "libx264" in (result.stdout + result.stderr)
 
 
+class RenderPublicationTests(unittest.TestCase):
+    def test_existing_output_and_project_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            partial, output = root / "partial.mp4", root / "final.mp4"
+            sidecar, qa = root / "final.project.json", root / "final.qa.json"
+            partial.write_bytes(b"new movie")
+            sidecar.write_bytes(b"existing project")
+            with self.assertRaises(FileExistsError):
+                publish_render(partial, output, {qa: "new report", sidecar: "new project"})
+            self.assertFalse(output.exists())
+            self.assertFalse(qa.exists())
+            self.assertEqual(sidecar.read_bytes(), b"existing project")
+
+            output.write_bytes(b"existing movie")
+            with self.assertRaises(FileExistsError):
+                publish_render(partial, output, {qa: "new report"})
+            self.assertFalse(qa.exists())
+            self.assertEqual(output.read_bytes(), b"existing movie")
+            self.assertEqual(partial.read_bytes(), b"new movie")
+
+
 @unittest.skipUnless(_has_encoder(), "FFmpeg/FFprobe with libx264 unavailable; real render path not runnable here")
 class RenderEndToEndTests(unittest.TestCase):
+    def test_trimmed_ramp_with_subframe_segment_and_reverse_decodes_every_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            src = root / "ramp.mp4"
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=60",
+                            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "1",
+                            "-c:v", "libx264", "-c:a", "aac", str(src)], check=True, timeout=30)
+            project = new_project("Subframe ramp")
+            project["settings"].update(output_profile="preview_30", beat_sync_priority=0, effects_intensity=0)
+            project["sources"] = [{"media_id": "media-ramp", "path": str(src), "duration_us": 1_000_000,
+                                   "has_audio": True, "video": {"avg_frame_rate": [60, 1]}}]
+            project["events"] = [{"event_id": "event-ramp", "source_media_id": "media-ramp",
+                                  "source_time_us": 200_000, "source_frame": 12, "in_us": 90_000,
+                                  "out_us": 640_000, "owner": "player", "confidence": 1, "tags": [],
+                                  "evidence": [], "is_user_override": True}]
+            clip = add_timeline_clip(project, "event-ramp")
+            spans = [(90_000, 380_000, 100, "forward"), (380_000, 401_667, 94, "forward"),
+                     (401_667, 420_000, 82, "forward"), (420_000, 423_333, 82, "forward"),
+                     (423_333, 445_000, 71, "forward"), (445_000, 640_000, 62, "forward"),
+                     (420_000, 640_000, 50, "reverse")]
+            clip["time_remap"] = [{"source_start_us": start, "source_end_us": end,
+                                   "speed_num": speed, "speed_den": 100, "direction": direction}
+                                  for start, end, speed, direction in spans]
+            normalize_timeline(project)
+            output = root / "trimmed.mp4"
+            result = render_montage(project, str(output), rights_acknowledged=False,
+                                    ownership_acknowledged=False, cancel_event=threading.Event(),
+                                    progress=lambda *_: None, render_mode="rough_preview")
+            self.assertEqual(result["qa"]["status"], "PASS")
+            self.assertEqual(result["qa"]["actual"]["frames_counted"], clip["duration_frames"])
+            self.assertEqual(result["qa"]["actual"]["audio_streams"], 1)
+
+    def test_reverse_segment_of_audio_source_does_not_leave_unconnected_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            src = root / "reverse-source.mp4"
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30",
+                            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "1",
+                            "-c:v", "libx264", "-c:a", "aac", str(src)], check=True, timeout=30)
+            project = new_project("Reverse audio routing")
+            project["settings"].update(output_profile="preview_30", beat_sync_priority=0, effects_intensity=0)
+            project["sources"] = [{"media_id": "media-reverse", "path": str(src), "duration_us": 1_000_000,
+                                   "has_audio": True, "video": {"avg_frame_rate": [30, 1]}}]
+            project["events"] = [{"event_id": "event-reverse", "source_media_id": "media-reverse", "source_time_us": 250_000,
+                                  "source_frame": 8, "in_us": 100_000, "out_us": 900_000,
+                                  "owner": "player", "confidence": 1, "tags": [], "evidence": [],
+                                  "is_user_override": True}]
+            clip = add_timeline_clip(project, "event-reverse")
+            clip["time_remap"] = [
+                {"source_start_us": 100_000, "source_end_us": 500_000, "speed_num": 1, "speed_den": 1, "direction": "forward"},
+                {"source_start_us": 500_000, "source_end_us": 900_000, "speed_num": 1, "speed_den": 1, "direction": "reverse"},
+            ]
+            normalize_timeline(project)
+            result = render_montage(project, str(root / "reverse.mp4"), rights_acknowledged=False,
+                                    ownership_acknowledged=False, cancel_event=threading.Event(),
+                                    progress=lambda *_: None, render_mode="rough_preview")
+            self.assertEqual(result["qa"]["actual"]["frames_counted"], 24)
+            self.assertTrue(any(check["message"] == "Output memiliki audio stream." and check["status"] == "PASS"
+                                for check in result["qa"]["checks"]))
+
+    def test_flash_and_standalone_shake_change_decoded_frames_at_impact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            src = root / "source.mp4"
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=60",
+                            "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
+                           capture_output=True, check=True, timeout=30)
+            project = new_project("Pixel evidence")
+            project["settings"].update(output_profile="youtube_60", beat_sync_priority=0, effects_intensity=0)
+            project["sources"] = [{"media_id": "media-effect", "path": str(src), "duration_us": 1_000_000,
+                                   "has_audio": False, "video": {"avg_frame_rate": [60, 1]}}]
+            project["events"] = [{"event_id": "event-effect", "source_media_id": "media-effect", "source_time_us": 300_000,
+                                  "source_frame": 18, "in_us": 100_000, "out_us": 500_000,
+                                  "owner": "player", "confidence": 1, "tags": [], "evidence": [],
+                                  "is_user_override": True}]
+            add_timeline_clip(project, "event-effect")
+            variants = {"baseline": None, "flash": {"type": "impact_flash", "enabled": True, "intensity": 0.24, "duration_frames": 3},
+                        "shake": {"type": "screen_shake", "enabled": True, "amplitude_px": 15, "duration_frames": 8}}
+            pixels = {}
+            for label, effect in variants.items():
+                variant = deepcopy(project)
+                if effect:
+                    variant["settings"]["effects_intensity"] = 0.45
+                    variant["timeline"][0]["effects"] = [effect]
+                output = root / f"{label}.mp4"
+                render_montage(variant, str(output), rights_acknowledged=False, ownership_acknowledged=False,
+                               cancel_event=threading.Event(), progress=lambda *_: None)
+                pixels[label] = subprocess.check_output(
+                    ["ffmpeg", "-v", "error", "-i", str(output), "-vf",
+                     "select=eq(n\\,12),scale=160:90,format=gray", "-frames:v", "1", "-f", "rawvideo", "-"],
+                    timeout=30)
+                self.assertEqual(len(pixels[label]), 160 * 90)
+            baseline = pixels["baseline"]
+            self.assertGreater((sum(pixels["flash"]) - sum(baseline)) / len(baseline), 20)
+            self.assertGreater(sum(abs(a - b) for a, b in zip(baseline, pixels["shake"])) / len(baseline), 1)
+
     def test_two_sources_three_manual_events_render_1440p144_and_write_qc(self) -> None:
         ffmpeg = shutil.which("ffmpeg")
         assert ffmpeg is not None

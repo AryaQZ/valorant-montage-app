@@ -63,17 +63,19 @@ class JobManager:
             progress = lambda value, message: self._update(job_id, progress=value, message=message)
             project = body["project"]
             if project.get("reference_draft"):
-                if body.get("render_mode", "master") != "master":
-                    raise ValueError("Draft upstream hanya mendukung export native 1080p60.")
+                if body.get("render_mode", "master") not in {"master", "effects_preview"}:
+                    raise ValueError("Draft upstream mendukung preview dengan efek dan ekspor 1080p60.")
                 result = render_reference(validate_project(project), body["output_path"],
                                           bool(body.get("rights_acknowledged")),
-                                          bool(body.get("ownership_acknowledged")), signal, progress)
+                                          bool(body.get("ownership_acknowledged")), signal, progress,
+                                          partial_token=body.get("partial_token"))
             else:
                 result = render_montage(project, body["output_path"],
                                     rights_acknowledged=bool(body.get("rights_acknowledged")),
                                     ownership_acknowledged=bool(body.get("ownership_acknowledged")),
                                     cancel_event=signal,
                                     render_mode=str(body.get("render_mode", "master")),
+                                    partial_token=body.get("partial_token"),
                                     progress=progress)
             self._update(job_id, status="complete" if result["state"] == "complete" else "needs_review",
                          progress=1.0, message=result["state"], result=result)

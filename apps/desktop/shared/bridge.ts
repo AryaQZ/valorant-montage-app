@@ -1,6 +1,14 @@
 import type { ChatGPTModel, LoginProfile, SessionState } from '@siwc/local';
 import type { MediaSource, Project, DirectorProposal, HighlightEvent, MusicTrack } from './project.js';
 
+export const MAX_AI_REQUESTS_PER_PROJECT = 5;
+export const AI_EFFORTS = ['auto', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+export type AIEffort = typeof AI_EFFORTS[number];
+
+export function supportsAIEffort(model: string): boolean {
+  return ['gpt-6.2-sol', 'gpt-6.2-astra', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'].includes(model);
+}
+
 export interface MediaToolsState {
   available: boolean;
   diagnostic?: string;
@@ -42,12 +50,18 @@ export interface KillCandidate {
   evidence: Array<Record<string, unknown>>;
 }
 
+export interface AIKillReview {
+  candidateId: string;
+  priority: 'prioritize' | 'check_again';
+}
+
 export interface AIState {
   session: SessionState;
   profiles: LoginProfile[];
   modelCatalog: { status: 'idle' | 'loading' | 'ready' | 'error'; models: ChatGPTModel[]; message?: string };
   selectedModel: string;
   accountBusy: boolean;
+  selectedEffort: AIEffort;
   aiBusy: boolean;
   aiActivity: string;
 }
@@ -113,12 +127,16 @@ export interface VMSBridge {
   getWorkerState(): Promise<WorkerState>;
   importRecordings(): Promise<MediaSource[]>;
   detectKills(source: MediaSource): Promise<{ candidates: KillCandidate[]; upstream_commit: string; status: string }>;
+  aiReviewKills(projectId: string, model: string, candidates: KillCandidate[]): Promise<{ reviews: AIKillReview[]; usageCount: number }>;
   generateReferenceDraft(project: Project): Promise<ReferenceDraft>;
   readReferenceDraft(project: Project): Promise<ReferenceDraft>;
   importMusic(): Promise<MusicTrack | null>;
   selectStyleReference(): Promise<NonNullable<Project['reference_video']> | null>;
   saveProject(project: Project, currentPath?: string | null): Promise<SaveResult | null>;
-  loadProject(): Promise<{ project: Project; path: string } | null>;
+  loadProject(recover?: boolean): Promise<{ project: Project; path: string | null; missingMediaPaths: string[] } | null>;
+  relinkRecording(source: MediaSource): Promise<MediaSource | null>;
+  relinkMusic(track: MusicTrack): Promise<Pick<MusicTrack, 'path' | 'filename'> | null>;
+  relinkReference(): Promise<NonNullable<Project['reference_video']> | null>;
   autosaveProject(project: Project): Promise<{ path: string }>;
   render(project: Project, acknowledgements: { rights: boolean; ownership: boolean }): Promise<{ job_id: string; output_path: string } | null>;
   renderPreview(project: Project, mode: 'rough_preview' | 'effects_preview', acknowledgements: { rights: boolean; ownership: boolean }): Promise<{ job_id: string; output_path: string; preview_url: string }>;
@@ -133,6 +151,7 @@ export interface VMSBridge {
   aiSelectProfile(profileId: string): Promise<AIState>;
   aiRefreshModels(): Promise<AIState>;
   aiSetModel(slug: string): Promise<AIState>;
+  aiSetEffort(effort: AIEffort): Promise<AIState>;
   aiCancelSignIn(): Promise<void>;
   aiDisconnect(): Promise<AIState>;
   aiOpenUsage(): Promise<void>;

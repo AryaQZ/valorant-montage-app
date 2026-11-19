@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from typing import Any
 from urllib.parse import unquote, urlparse
 import hmac
 import json
 import logging
+import os
 import secrets
 import socket
 import sys
+import time
 
 from . import __version__
 from .audio_beats import analyze_music
@@ -99,10 +102,12 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 self._json(200, {"indexed": True, "counts": counts})
             elif route == "/v1/render/preflight":
                 project = body["project"]
-                check = reference_preflight if project.get("reference_draft") else preflight
-                self._json(200, check(validate_project(project), body["output_path"],
-                                          bool(body.get("rights_acknowledged")),
-                                          bool(body.get("ownership_acknowledged"))))
+                args = (validate_project(project), body["output_path"],
+                        bool(body.get("rights_acknowledged")), bool(body.get("ownership_acknowledged")))
+                if project.get("reference_draft"):
+                    self._json(200, reference_preflight(*args))
+                else:
+                    self._json(200, preflight(*args, render_mode=body.get("render_mode", "master")))
             elif route == "/v1/reference/draft":
                 self._json(200, create_reference_draft(body["project"]))
             elif route == "/v1/reference/read":
@@ -169,15 +174,53 @@ class WorkerHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def _wait_for_desktop_exit(pid: int) -> None:
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            return
+        try:
+            kernel.WaitForSingleObject(handle, 0xFFFFFFFF)
+        finally:
+            kernel.CloseHandle(handle)
+    else:
+        while os.getppid() == pid:
+            time.sleep(0.25)
+
+
 def serve() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(message)s")
+    parent_pid = os.environ.get("VMS_WORKER_PARENT_PID", "")
+    desktop_owned = parent_pid.isdecimal() and int(parent_pid) > 0
+    if desktop_owned and os.name == "nt":
+        from .windows_lifecycle import protect_child_processes
+
+        try:
+            protect_child_processes()
+        except OSError as exc:
+            LOG.warning("Windows worker child-process protection is unavailable (%s).", exc.winerror)
     token = secrets.token_urlsafe(32)
     server = WorkerServer(("127.0.0.1", 0), token)
     ready = {"type": "ready", "port": server.server_port, "token": token,
              "worker_version": __version__}
     sys.stdout.write(json.dumps(ready) + "\n")
     sys.stdout.flush()
+    if desktop_owned:
+        def close_when_studio_exits() -> None:
+            _wait_for_desktop_exit(int(parent_pid))
+            server.shutdown()
+
+        Thread(target=close_when_studio_exits, name="studio-parent", daemon=True).start()
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

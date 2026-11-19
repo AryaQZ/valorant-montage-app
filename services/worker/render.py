@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from functools import lru_cache
 from typing import Any, Callable
 import json
 import math
@@ -10,15 +11,25 @@ import os
 import shutil
 import subprocess
 import tempfile
-import uuid
 
-from .media import MediaToolError, probe_audio, probe_media
+from .media import MediaToolError, probe_audio, probe_media, publish_render, render_partial_path
 from .schema import PROFILE_DIMENSIONS, PROFILES, ProjectValidationError, frames_to_duration_us, validate_project
 from .quality import (_audit_beat_sync, _has_measured_attacks, find_near_duplicate_plays,
                       missing_default_editing_requirements, run_quality_control)
 from .upstream import render_rife_segment, UPSTREAM_COMMIT
 
 ProgressCallback = Callable[[float, str], None]
+
+
+@lru_cache(maxsize=4)
+def _filter_buffer_options(ffmpeg: str) -> tuple[str, ...]:
+    try:
+        result = subprocess.run([ffmpeg, "-hide_banner", "-h", "full"], capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    # FFmpeg 9 can stop a pathological filter queue instead of exhausting system memory.
+    return ("-filter_buffered_frames", "256") if "-filter_buffered_frames " in result.stdout else ()
 
 
 def preflight(project: dict[str, Any], output_path: str, rights_acknowledged: bool,
@@ -66,6 +77,8 @@ def preflight(project: dict[str, Any], output_path: str, rights_acknowledged: bo
     destination = Path(output_path).expanduser().resolve()
     if destination.suffix.lower() != ".mp4":
         errors.append("File output harus berekstensi .mp4.")
+    elif any(destination.with_suffix(suffix).exists() for suffix in (".mp4", ".project.json", ".qa.json", ".qa.html")):
+        errors.append("File output, project, atau QA dengan nama ini sudah ada. Pilih nama baru.")
     if not destination.parent.exists():
         errors.append("Folder output tidak ditemukan.")
     elif not os.access(destination.parent, os.W_OK):
@@ -109,7 +122,8 @@ def preflight(project: dict[str, Any], output_path: str, rights_acknowledged: bo
 
 def render_montage(project: dict[str, Any], output_path: str, *, rights_acknowledged: bool,
                    ownership_acknowledged: bool, cancel_event: Any,
-                   progress: ProgressCallback, render_mode: str = "master") -> dict[str, Any]:
+                   progress: ProgressCallback, render_mode: str = "master",
+                   partial_token: str | None = None) -> dict[str, Any]:
     if render_mode not in {"master", "rough_preview", "effects_preview"}:
         raise ProjectValidationError("Render mode tidak didukung.")
     project = validate_project(project, require_timeline=True)
@@ -119,7 +133,7 @@ def render_montage(project: dict[str, Any], output_path: str, *, rights_acknowle
     destination = Path(report["output_path"])
     if destination.exists():
         raise ProjectValidationError(f"Output sudah ada; pilih nama lain: {destination}")
-    partial = destination.with_name(f".{destination.stem}.{uuid.uuid4().hex[:8]}.partial.mp4")
+    partial = render_partial_path(destination, partial_token)
     fps = report["fps"]
     total_frames = report["total_frames"]
     duration_seconds = total_frames / fps
@@ -169,8 +183,8 @@ def render_montage(project: dict[str, Any], output_path: str, *, rights_acknowle
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise MediaToolError("FFmpeg tidak ditemukan di PATH.")
-    command = [ffmpeg, "-hide_banner", "-nostats", "-y", *inputs,
-               "-filter_complex", graph, "-map", out_video, "-map", out_audio,
+    command = [ffmpeg, "-hide_banner", "-nostats", "-y", *_filter_buffer_options(ffmpeg), *inputs,
+               "-filter_complex_threads", "2", "-filter_complex", graph, "-map", out_video, "-map", out_audio,
                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
                "-r", f"{fps}/1", "-fps_mode", "cfr", "-c:a", "aac", "-b:a", "320k",
                "-ar", "48000", "-ac", "2", "-movflags", "+faststart", "-t", f"{duration_seconds:.9f}",
@@ -223,7 +237,6 @@ def render_montage(project: dict[str, Any], output_path: str, *, rights_acknowle
         if not partial.is_file() or partial.stat().st_size < 1024:
             raise MediaToolError("FFmpeg tidak menghasilkan file output yang valid.")
         progress(0.99, "Memeriksa output dan menjalankan QC")
-        os.replace(partial, destination)
         timeline_payload = json.dumps(project["timeline"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         import hashlib
         project["render_manifest"] = {
@@ -265,17 +278,16 @@ def render_montage(project: dict[str, Any], output_path: str, *, rights_acknowle
             ],
         }
         sidecar = destination.with_suffix(".project.json")
-        sidecar.write_text(json.dumps(project, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        try:
-            qc = run_quality_control(str(destination), project)
-        except Exception:
-            destination.unlink(missing_ok=True)
-            sidecar.unlink(missing_ok=True)
-            raise
+        qc = run_quality_control(str(partial), project)
+        if cancel_event.is_set():
+            raise InterruptedError("Render dibatalkan pengguna.")
         qa_json = destination.with_suffix(".qa.json")
         qa_html = destination.with_suffix(".qa.html")
-        qa_json.write_text(json.dumps(qc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        qa_html.write_text(_html_report(qc), encoding="utf-8")
+        publish_render(partial, destination, {
+            sidecar: json.dumps(project, ensure_ascii=False, indent=2) + "\n",
+            qa_json: json.dumps(qc, ensure_ascii=False, indent=2) + "\n",
+            qa_html: _html_report(qc),
+        })
         progress(1.0, f"QC {qc['status']}")
         return {"output_path": str(destination), "project_sidecar": str(sidecar),
                 "qa_json": str(qa_json), "qa_html": str(qa_html), "qa": qc,
@@ -382,6 +394,7 @@ def _build_filter_graph(project: dict[str, Any], fps: int, clip_audio: list[bool
     gameplay_gain = float(project["settings"].get("gameplay_gain", 1.0))
     music_gain = float(project["settings"].get("music_gain", 0.18))
     event_by_id = {event["event_id"]: event for event in project["events"]}
+    source_by_id = {source["media_id"]: source for source in project["sources"]}
     clip_video_labels: list[str] = []
     clip_audio_labels: list[str] = []
     sfx_labels: list[str] = []
@@ -390,23 +403,40 @@ def _build_filter_graph(project: dict[str, Any], fps: int, clip_audio: list[bool
 
     for index, clip in enumerate(project["timeline"]):
         event = event_by_id[clip["event_id"]]
+        source = source_by_id[clip["source_media_id"]]
+        video_metadata = source.get("video")
+        video_metadata = video_metadata if isinstance(video_metadata, dict) else {}
+        rate = video_metadata.get("avg_frame_rate")
+        source_interval = 1 / 30
+        if isinstance(rate, (tuple, list)) and len(rate) == 2 and all(type(part) is int and part > 0 for part in rate):
+            source_interval = rate[1] / rate[0]
+        timestamps = video_metadata.get("timestamp_behavior")
+        if isinstance(timestamps, dict):
+            measured_interval = timestamps.get("median_frame_interval_us")
+            if type(measured_interval) is int and measured_interval > 0:
+                source_interval = measured_interval / 1_000_000
         segment_pairs: list[str] = []
         segment_audio: list[str] = []
         segment_count = len(clip["time_remap"])
+        clip_start = clip["in_us"] / 1_000_000
+        clip_end = clip["out_us"] / 1_000_000
         ordinary_segments = [part for part in range(segment_count) if (index, part) not in rife_inputs]
         if len(ordinary_segments) > 1:
             ordinary_labels = [f"vsrc{index}_{part}" for part in ordinary_segments]
-            graph.append(f"[{index}:v:0]split={len(ordinary_labels)}" + "".join(f"[{label}]" for label in ordinary_labels))
+            graph.append(f"[{index}:v:0]trim=start={clip_start:.6f}:end={clip_end:.6f},split={len(ordinary_labels)}"
+                         + "".join(f"[{label}]" for label in ordinary_labels))
             video_source_labels = dict(zip(ordinary_segments, ordinary_labels))
         elif ordinary_segments:
             video_source_labels = {ordinary_segments[0]: f"{index}:v:0"}
         else:
             video_source_labels = {}
-        if clip_audio[index] and segment_count > 1:
-            audio_source_labels = [f"asrc{index}_{part}" for part in range(segment_count)]
-            graph.append(f"[{index}:a:0]asplit={segment_count}" + "".join(f"[{label}]" for label in audio_source_labels))
-        else:
-            audio_source_labels = [f"{index}:a:0"] if clip_audio[index] else []
+        forward_audio = [part for part, segment in enumerate(clip["time_remap"])
+                         if clip_audio[index] and segment.get("direction", "forward") == "forward"]
+        audio_source_labels = {part: f"{index}:a:0" for part in forward_audio}
+        if len(forward_audio) > 1:
+            audio_source_labels = {part: f"asrc{index}_{part}" for part in forward_audio}
+            graph.append(f"[{index}:a:0]atrim=start={clip_start:.6f}:end={clip_end:.6f},asplit={len(forward_audio)}"
+                         + "".join(f"[{label}]" for label in audio_source_labels.values()))
         for segment_index, segment in enumerate(clip["time_remap"]):
             video_label = f"v{index}_{segment_index}"
             audio_label = f"a{index}_{segment_index}"
@@ -422,21 +452,39 @@ def _build_filter_graph(project: dict[str, Any], fps: int, clip_audio: list[bool
                          f"setpts=N/({fps}*TB),scale={width}:{height}:force_original_aspect_ratio=increase,"
                          f"crop={width}:{height},setsar=1,format=yuv420p[{video_label}]")
             else:
-                video = f"[{video_source_labels[segment_index]}]trim=start={src_start:.6f}:end={src_end:.6f},setpts=PTS-STARTPTS"
-                if segment.get("direction", "forward") == "reverse":
+                reverse = segment.get("direction", "forward") == "reverse"
+                video_start, video_end = src_start, src_end
+                # A trimmed ramp can begin and end between decoded timestamps.
+                # Supply pictures from the same clip without extending the authored output.
+                minimum_window = 2 * source_interval
+                if src_end - src_start < minimum_window:
+                    video_end = min(clip_end, max(src_end, src_start + minimum_window))
+                    video_start = max(clip_start, min(src_start, video_end - minimum_window))
+                video = (f"[{video_source_labels[segment_index]}]trim=start={video_start:.6f}:end={video_end:.6f},"
+                         "setpts=PTS-STARTPTS")
+                if reverse:
                     video += ",reverse,setpts=PTS-STARTPTS"
-                video += (f",setpts=PTS*{speed_den}/{speed_num},"
-                          f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
+                if enable_effects and segment_frames > 1 and video_end - video_start >= 4 * source_interval:
+                    cadence = f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+                else:
+                    cadence = f"tpad=stop_mode=clone:stop=2,fps={fps}"
+                video += (f",setpts=PTS*{speed_den}/{speed_num},{cadence},"
                           f"tpad=stop_mode=clone:stop_duration={segment_duration:.9f},trim=end_frame={segment_frames},"
                           f"setpts=N/({fps}*TB),scale={width}:{height}:force_original_aspect_ratio=increase,"
                           f"crop={width}:{height},setsar=1,format=yuv420p[{video_label}]")
             graph.append(video)
             segment_pairs.append(f"[{video_label}]")
 
-            if clip_audio[index] and segment.get("direction", "forward") == "forward":
-                tempo = _atempo_filters(speed_num, speed_den)
+            if segment_index in audio_source_labels:
+                tempo = ""
+                if speed_num != speed_den:
+                    # The time-stretch filter must receive a complete analysis window.
+                    # A few milliseconds of audio can otherwise yield no samples at all.
+                    if src_end - src_start < 0.1:
+                        tempo = "apad=pad_dur=0.1,"
+                    tempo += _atempo_filters(speed_num, speed_den) + ","
                 audio = (f"[{audio_source_labels[segment_index]}]atrim=start={src_start:.6f}:end={src_end:.6f},asetpts=PTS-STARTPTS,"
-                         f"aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,{tempo},"
+                         f"aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,{tempo}"
                          f"volume={float(clip.get('audio_gain', gameplay_gain)):.4f},apad,atrim=duration={segment_duration:.9f}[{audio_label}]")
             else:
                 audio = f"anullsrc=r=48000:cl=stereo,atrim=duration={segment_duration:.9f}[{audio_label}]"
@@ -482,6 +530,11 @@ def _build_filter_graph(project: dict[str, Any], fps: int, clip_audio: list[bool
                 zoom_expression = f"1+{_max_expression(zoom_parts)}"
             else:
                 zoom_expression = primary_zoom
+            if shake_amount > 0:
+                # zoompan clamps x/y to the crop's valid area. Reserve enough
+                # pixels for shake even when there is no separate zoom effect.
+                overscan = max(shake_amount * 2 / width, shake_amount * 1.44 / height)
+                zoom_expression = f"max({zoom_expression},1/(1-{overscan:.9f}*{envelope}))"
             chain.append(f"zoompan=z='{zoom_expression}':x='{x}':y='{y}':d=1:s={width}x{height}:fps={fps}")
         flash = next((item for item in effects if item.get("type") == "impact_flash"), None)
         if flash:
@@ -490,7 +543,7 @@ def _build_filter_graph(project: dict[str, Any], fps: int, clip_audio: list[bool
             flash_parts = [f"if(between(n,{frame},{frame + flash_duration - 1}),"
                            f"{flash_intensity:.5f}*max(0,1-(n-{frame})/{flash_duration}),0)"
                            for frame in impact_frames]
-            chain.append(f"eq=brightness='{_max_expression(flash_parts)}'")
+            chain.append(f"eq=brightness='{_max_expression(flash_parts)}':eval=frame")
         blur = next((item for item in effects if item.get("type") == "motion_blur"), None)
         if blur and float(blur.get("strength", 0.0)) > 0:
             window = int(blur.get("window_frames", 3))

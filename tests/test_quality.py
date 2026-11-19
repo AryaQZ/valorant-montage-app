@@ -113,6 +113,26 @@ class QualityControlTests(unittest.TestCase):
             result = _detect_intervals(Path("unused.mp4"), "blackdetect", r"black_start:([0-9.]+)")
         self.assertIsNone(result)
 
+    def test_unavailable_audio_peak_and_manifest_only_effects_need_review(self) -> None:
+        project = self._project()
+        media = {"video": {"width": 2560, "height": 1440, "avg_frame_rate": (144, 1)},
+                 "has_audio": True, "audio": [{"duration_us": 1_000_000, "start_time_us": 0}],
+                 "duration_us": 1_000_000}
+        timing = {"monotonic": True, "cfr": True, "frames": 144, "max_delta_error_us": 0,
+                  "first_pts_s": 0.0, "last_pts_s": 143 / 144}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "fixture.mp4"
+            output.touch()
+            with (patch("services.worker.quality.probe_media", return_value=media),
+                  patch("services.worker.quality._audit_pts", return_value=timing),
+                  patch("services.worker.quality._max_duplicate_run", return_value=1),
+                  patch("services.worker.quality._detect_intervals", return_value=[]),
+                  patch("services.worker.quality._measure_peak", return_value=None)):
+                report = run_quality_control(str(output), project)
+        self.assertEqual(next(check for check in report["checks"] if "Peak audio tidak" in check["message"])["status"], "WARN")
+        self.assertEqual(report["feature_gates"]["visual_effects"]["status"], "MANIFEST_ONLY")
+        self.assertEqual(report["status"], "WARN")
+
     def test_requested_beat_sync_without_music_or_measured_attacks_fails(self) -> None:
         project = self._project()
         project["settings"]["beat_sync_priority"] = 0.75
@@ -270,7 +290,9 @@ class QualityControlTests(unittest.TestCase):
         self.assertEqual(report["beat_sync"]["events"], [])
         self.assertEqual(report["feature_gates"]["beat_sync"]["status"], "NOT_REQUESTED")
         self.assertFalse(any("Offset visual impact" in item["message"] for item in report["checks"]))
-        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["status"], "WARN")
+        self.assertEqual([item["message"].split(":")[0] for item in report["checks"] if item["status"] == "WARN"],
+                         ["visual_effects"])
 
     def test_preflight_blocks_requested_beat_sync_without_local_music(self) -> None:
         project = self._project()

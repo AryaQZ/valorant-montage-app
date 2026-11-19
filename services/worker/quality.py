@@ -15,7 +15,7 @@ from .media import MediaToolError, probe_media
 from .schema import PROFILE_DIMENSIONS, PROFILES, frames_to_duration_us
 
 
-FEATURE_STATES = {"NOT_REQUESTED", "NOT_APPLICABLE", "EXECUTED_SUCCESSFULLY", "REQUESTED_BUT_MISSING"}
+FEATURE_STATES = {"NOT_REQUESTED", "NOT_APPLICABLE", "EXECUTED_SUCCESSFULLY", "REQUESTED_BUT_MISSING", "MANIFEST_ONLY"}
 ATTACK_STRENGTH_FLOOR = {"low": 0.5, "mid": 0.6, "high": 0.65}
 
 
@@ -183,7 +183,7 @@ def run_quality_control(path_value: str, project: dict[str, Any]) -> dict[str, A
     else:
         check(not silence, f"Silence >=1 detik terdeteksi: {len(silence)}.", warning=True)
     peak = _measure_peak(path)
-    check(peak is None or peak < -0.1, "Peak audio di bawah -0.1 dBFS." if peak is not None else
+    check(peak is not None and peak < -0.1, "Peak audio di bawah -0.1 dBFS." if peak is not None else
           "Peak audio tidak dapat diukur; filter volumedetect tidak tersedia.", warning=peak is None)
     status = "FAIL" if failures else "WARN" if warnings else "PASS"
     effect_types = sorted({effect_type for item in (manifest.get("effects_applied") or [])
@@ -218,7 +218,6 @@ def run_quality_control(path_value: str, project: dict[str, Any]) -> dict[str, A
     else:
         check(traced_event_ids == expected_event_ids,
               "Manifest render v1 mencatat impact utama pada setiap clip timeline.")
-    check(True, f"Efek yang dirender: {', '.join(effect_types) if effect_types else 'tidak ada (rough preview mode)'}.")
     interpolation = manifest.get("interpolation") or {}
     rife_segments = interpolation.get("rife_segments") or []
     check(all(isinstance(item, dict) and isinstance(item.get("cache_key"), str)
@@ -251,6 +250,8 @@ def run_quality_control(path_value: str, project: dict[str, Any]) -> dict[str, A
     for name, gate in feature_gates.items():
         if gate["status"] == "REQUESTED_BUT_MISSING":
             check(False, f"{name}: {gate['message'].rstrip('.')}.")
+        elif gate["status"] == "MANIFEST_ONLY":
+            check(False, f"{name}: {gate['message'].rstrip('.')}.", warning=True)
     status = "FAIL" if failures else "WARN" if warnings else "PASS"
     return {"report_version": 2, "status": status, "file": str(path),
             "expected": {"width": expected_width, "height": expected_height, "fps": fps,
@@ -384,7 +385,7 @@ def _feature_gates(project: dict[str, Any], manifest: dict[str, Any], beat_sync:
             effects_gate = _feature_gate("REQUESTED_BUT_MISSING", "Render manifest kehilangan contextual effects yang dijadwalkan.",
                                          missing_by_clip=missing)
         else:
-            effects_gate = _feature_gate("EXECUTED_SUCCESSFULLY", "Effects timeline tercatat pada output render.",
+            effects_gate = _feature_gate("MANIFEST_ONLY", "Efek tercatat di manifest. Periksa frame hasil untuk memverifikasi tampilannya.",
                                          effect_types=sorted({kind for kinds in expected_effects.values() for kind in kinds}))
 
     if render_mode == "rough_preview":
@@ -427,7 +428,7 @@ def _feature_gates(project: dict[str, Any], manifest: dict[str, Any], beat_sync:
             transition_gate = _feature_gate("REQUESTED_BUT_MISSING", "Render manifest kehilangan transition yang dijadwalkan.",
                                             missing_by_clip=missing)
         else:
-            transition_gate = _feature_gate("EXECUTED_SUCCESSFULLY", "Transition timeline tercatat pada output render.")
+            transition_gate = _feature_gate("MANIFEST_ONLY", "Transisi tercatat di manifest. Periksa frame hasil untuk memverifikasi tampilannya.")
 
     near_duplicate_plays = find_near_duplicate_plays(project)
     if not timeline:

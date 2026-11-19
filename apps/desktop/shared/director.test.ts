@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { applyProposal, createProject, type HighlightEvent, type MediaSource, type Project } from './project.js';
+import { applyProposal, createProject, makeClip, removeReviewedHighlight, resizeClipRange, toggleReverseImpactReplay, type HighlightEvent, type MediaSource, type Project } from './project.js';
 import { buildRuleProposal, validateAIProposal } from './director.js';
 
 function fixture(): Project {
@@ -35,6 +35,19 @@ function measuredMusic(project: Project, markerTimes: number[]) {
 }
 
 describe('Creative Director proposals', () => {
+  it('preserves the edited ramp and reverse replay when trimming or extending a clip', () => {
+    const project = fixture();
+    const clip = makeClip(project, project.events[0]);
+    toggleReverseImpactReplay(clip, project.events[0], true, 144);
+    expect(clip.time_remap.some(segment => segment.direction === 'reverse')).toBe(true);
+    resizeClipRange(clip, 2_200_000, 4_500_000);
+    expect(clip.time_remap.some(segment => segment.direction === 'reverse')).toBe(true);
+    expect(clip.time_remap.some(segment => segment.direction === 'forward' && segment.speed_num < segment.speed_den)).toBe(true);
+    expect(clip.time_remap.every(segment => segment.source_start_us >= 2_200_000 && segment.source_end_us <= 4_500_000)).toBe(true);
+    resizeClipRange(clip, 2_000_000, 5_000_000);
+    expect(clip.time_remap[0].source_start_us).toBe(2_000_000);
+    expect(clip.time_remap.at(-1)?.source_end_us).toBe(5_000_000);
+  });
   it('creates a deterministic rule-only plan from reviewed annotations', () => {
     const first = buildRuleProposal(fixture());
     const second = buildRuleProposal(fixture());
@@ -105,6 +118,23 @@ describe('Creative Director proposals', () => {
       expect.arrayContaining(['impact_flash', 'screen_shake', 'motion_blur']));
     expect(grouped?.time_remap.length).toBeGreaterThan(1);
     expect(accepted.director.last_proposal?.clip_plans).toHaveLength(2);
+  });
+
+  it('keeps the surviving impact when the primary highlight of a group is deleted', () => {
+    const project = fixture();
+    const [primary, survivor] = project.events;
+    primary.out_us = survivor.out_us;
+    const grouped = makeClip(project, primary);
+    grouped.included_event_ids = [primary.event_id, survivor.event_id];
+    project.timeline = [grouped];
+
+    removeReviewedHighlight(project, primary.event_id);
+
+    expect(project.events).toEqual([survivor]);
+    expect(project.timeline).toHaveLength(1);
+    expect(project.timeline[0]).toMatchObject({ clip_id: grouped.clip_id, event_id: survivor.event_id,
+      included_event_ids: [survivor.event_id], in_us: survivor.in_us, out_us: survivor.out_us, output_start_frame: 0 });
+    expect(project.timeline[0].time_remap.every(segment => segment.source_start_us >= survivor.in_us)).toBe(true);
   });
 
   it('drops duplicate upstream candidates tied to the same kill-feed row', () => {

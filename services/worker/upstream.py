@@ -382,18 +382,13 @@ def detect_kills(path_value: str, source_media_id: str, duration_us: int | None)
         kverify = verification.get(f"c1@{item['K']}", verification.get(f"c1@{old_k}", {}))
         rank_row = next((row for row in ranked.get("kills", []) if str(row.get("id")) == str(key)), {})
         headshot_score = item.get("headshot")
-        rank_run = rank_row.get("run") or []
-        # Context affects the director's selection and effect schedule. Do not
-        # let a probabilistic feed-lag guess masquerade as a verified headshot
-        # or multikill: kverify's actual shot-frame result is the gate.
+        # Rank run describes the surrounding streak. This candidate marks one shot.
         shot_how = kverify.get("how")
         verified_on_frame = (kverify.get("verdict") in {"verified", "correct"}
                              and shot_how in {"ammo", "flash"})
         suggested_tags = []
         if verified_on_frame and isinstance(headshot_score, (int, float)) and headshot_score >= 0.6:
             suggested_tags.append("headshot")
-        if verified_on_frame and rank_run and isinstance(rank_run[0], int) and rank_run[0] >= 2:
-            suggested_tags.append("multikill")
         fallback_frame = round((source_time_us - source_start_us) * source_fps / 1_000_000)
         source_frame, source_frame_mapping = _nearest_source_frame(source_pts, source_time_us, fallback_frame)
         review_sheet = str(work / f"autokill_{int(key) // 5 + 1:02d}.jpg")
