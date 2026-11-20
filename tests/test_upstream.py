@@ -258,6 +258,109 @@ class UpstreamDetectionTests(unittest.TestCase):
             self.assertEqual(args[args.index("--end-us") + 1], "2000000")
             self.assertEqual(args[args.index("--source-fps-num") + 1], "60")
 
+    def test_detect_kills_uses_fast_cfr_without_rife_for_sub_60fps_vfr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "vfr_49fps.mp4"
+            source.write_bytes(b"fixture")
+            app_data = root / "appdata"
+            media = {
+                "path": str(source),
+                "duration_us": 10_000_000,
+                "video": {"avg_frame_rate": (53700000, 1087811), "start_time_us": 0},
+            }
+            runs: list[str] = []
+            fast_cfr_calls: list[Path] = []
+
+            def fake_fast_cfr(src: Path, work: Path) -> None:
+                fast_cfr_calls.append(src)
+                (work / "src").mkdir(parents=True, exist_ok=True)
+                (work / "src" / "ingest.json").write_text('{"c1":{"t0":0.0375}}', encoding="utf-8")
+
+            def fake_run(python: str, script: Path, args: list[str], cwd: Path, timeout: int,
+                         *, allow_nonzero: bool = False) -> str:
+                runs.append(script.name)
+                if script.name == "kills_auto.py":
+                    (Path(cwd) / "kills.json").write_text("{}", encoding="utf-8")
+                return ""
+
+            with (patch.object(upstream, "upstream_python", return_value="python"),
+                  patch.object(upstream, "probe_media", return_value=media),
+                  patch.object(upstream, "app_data_dir", return_value=app_data),
+                  patch.object(upstream, "_fast_cfr_ingest", side_effect=fake_fast_cfr),
+                  patch.object(upstream, "_run", side_effect=fake_run)):
+                result = upstream.detect_kills(str(source), "media-vfr", 10_000_000)
+
+            self.assertEqual(fast_cfr_calls, [source])
+            self.assertNotIn("ingest.py", runs)
+            self.assertEqual(runs[:2], ["mkpts.py", "kills_auto.py"])
+            self.assertEqual(result["candidate_count"], 0)
+
+    def test_detect_kills_deduplicates_repeated_same_kill_and_scopes_candidate_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "replay.mp4"
+            source.write_bytes(b"fixture")
+            app_data = root / "appdata"
+            media = {"path": str(source), "duration_us": 20_000_000,
+                     "video": {"avg_frame_rate": (60, 1), "start_time_us": 0}}
+
+            def fake_run(python: str, script: Path, args: list[str], cwd: Path, timeout: int,
+                         *, allow_nonzero: bool = False) -> str:
+                work = Path(cwd)
+                if script.name == "kills_auto.py":
+                    (work / "src").mkdir(parents=True, exist_ok=True)
+                    (work / "src" / "ingest.json").write_text('{"c1":{"t0":0}}', encoding="utf-8")
+                    # Two detections for the same kill (scrolled feed row within 4 frames / same shot K=300 vs 302)
+                    # plus a distinct second kill at K=600.
+                    (work / "kills.json").write_text(json.dumps({
+                        "0": {"clip": "c1", "K": 300, "feed": 308, "conf": "medium", "method": "ammo", "how": "ammo", "verified": True},
+                        "1": {"clip": "c1", "K": 302, "feed": 312, "conf": "high", "method": "ammo+audio", "how": "ammo", "verified": True},
+                        "2": {"clip": "c1", "K": 600, "feed": 608, "conf": "high", "method": "ammo+audio", "how": "ammo", "verified": True},
+                    }), encoding="utf-8")
+                elif script.name == "kverify.py":
+                    output_prefix = Path(args[args.index("--out") + 1])
+                    output_prefix.parent.mkdir(parents=True, exist_ok=True)
+                    output_prefix.with_suffix(".json").write_text(json.dumps({
+                        "c1@300": {"clip": "c1", "K": 300, "verdict": "verified", "how": "ammo"},
+                        "c1@302": {"clip": "c1", "K": 302, "verdict": "verified", "how": "ammo"},
+                        "c1@600": {"clip": "c1", "K": 600, "verdict": "verified", "how": "ammo"},
+                    }), encoding="utf-8")
+                elif script.name == "kill_rank.py":
+                    (work / "kill_rank.json").write_text(json.dumps({
+                        "kills": [
+                            {"id": "0", "score": 2.0, "rank": 3},
+                            {"id": "1", "score": 4.2, "rank": 1},
+                            {"id": "2", "score": 3.5, "rank": 2},
+                        ],
+                        "duplicates_dropped": [],
+                    }), encoding="utf-8")
+                return ""
+
+            with (patch.object(upstream, "upstream_python", return_value="python"),
+                  patch.object(upstream, "probe_media", return_value=media),
+                  patch.object(upstream, "app_data_dir", return_value=app_data),
+                  patch.object(upstream, "_source_packet_timestamps", return_value=[]),
+                  patch.object(upstream, "_run", side_effect=fake_run)):
+                result = upstream.detect_kills(str(source), "src-alpha", 20_000_000)
+
+            self.assertEqual(result["candidate_count"], 2)
+            ids = [c["candidate_id"] for c in result["candidates"]]
+            self.assertEqual(ids, ["upstream-src-alpha-1", "upstream-src-alpha-2"])
+            self.assertEqual(result["candidates"][0]["confidence_label"], "high")
+
+    def test_replay_scan_deduplicates_scrolled_rows(self) -> None:
+        from services.worker import replay_scan
+
+        shots = [
+            {"K": 1529, "feed": 1539, "conf": "medium", "how": "ammo", "verified": True},
+            {"K": 1531, "feed": 1543, "conf": "high", "how": "ammo", "verified": True},
+            {"K": 2858, "feed": 2868, "conf": "high", "how": "ammo", "verified": True},
+        ]
+        deduped = replay_scan._deduplicate_shots(shots)
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual([item["K"] for item in deduped], [1531, 2858])
+
 
 if __name__ == "__main__":
     unittest.main()

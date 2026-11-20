@@ -13,7 +13,7 @@ import { AI_EFFORTS, MAX_AI_REQUESTS_PER_PROJECT, supportsAIEffort,
   type AIEffort, type AIState, type AIDraftResult, type KillCandidate, type ReferenceDraft, type RenderJob, type WorkerState } from '../shared/bridge.js';
 import { rebuildTimeline, type MediaSource, type MusicTrack, type Project } from '../shared/project.js';
 import { validateAIProposal } from '../shared/director.js';
-import { killReviewMetadata, validateKillReview } from '../shared/kill-review.js';
+import { killReviewMetadata, parseJsonOnly, validateKillReview } from '../shared/kill-review.js';
 import { createElectronCredentialEncryption } from './credential-encryption.js';
 import { requestLocalWorker } from './worker-client.js';
 import { buildWorkerEnv, resolveWorkerPython } from './worker-python.js';
@@ -542,11 +542,6 @@ async function requestChatGPT(model: string, payload: Record<string, unknown>, i
     aiActivity = '';
     await refreshAIState();
   }
-}
-
-function parseJsonOnly(text: string): unknown {
-  try { return JSON.parse(text); }
-  catch { throw new Error('The response was not valid JSON.'); }
 }
 
 function setupIpc(): void {

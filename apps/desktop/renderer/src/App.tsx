@@ -105,7 +105,10 @@ export default function App() {
   const [musicRights, setMusicRights] = useState(false);
   const [ownerRights, setOwnerRights] = useState(false);
   const [draggingClip, setDraggingClip] = useState('');
-  const [killCandidates, setKillCandidates] = useState<KillCandidate[]>([]);
+  const [candidatesBySource, setCandidatesBySource] = useState<Record<string, KillCandidate[]>>({});
+  const [candidateFilter, setCandidateFilter] = useState<'all' | 'selected'>('all');
+  const [scanProgress, setScanProgress] = useState<{ current: number; total: number; filename: string } | null>(null);
+  const cancelScanRef = useRef(false);
   const [aiKillReviews, setAIKillReviews] = useState<AIKillReview[]>([]);
 
   useEffect(() => { document.title = `VALORANT Montage Studio · Versi ${version}`; }, []);
@@ -140,14 +143,20 @@ export default function App() {
   useEffect(() => { setMusicRights(false); }, [project.project_id, project.music?.path, project.music?.duration_us]);
 
   useEffect(() => {
+    setCandidatesBySource({});
+    setAIKillReviews([]);
+    setCandidateFilter('all');
+    setScanProgress(null);
+    cancelScanRef.current = false;
+  }, [project.project_id]);
+
+  useEffect(() => {
     setManualMarking(false);
     setEventIn('');
     setEventImpact('');
     setEventOut('');
     setEventTags([]);
     setEventOwner('player');
-    setKillCandidates([]);
-    setAIKillReviews([]);
   }, [selectedSourceId, project.project_id]);
 
   useEffect(() => {
@@ -251,21 +260,33 @@ export default function App() {
   });
 
   const selectedSource = project.sources.find(item => item.media_id === selectedSourceId) ?? null;
+  const availableSources = project.sources.filter(source => !missingMediaPaths.includes(source.path));
   const musicMissing = !!project.music && missingMediaPaths.includes(project.music.path);
   const referenceMissing = !!project.reference_video && missingMediaPaths.includes(project.reference_video.path);
   const aiReviewOrder = new Map(aiKillReviews.map((review, index) => [review.candidateId, { ...review, index }]));
-  const activeCandidates = killCandidates.filter(candidate => !isDismissedCandidate(project, candidate));
-  const dismissedCount = project.dismissed_kill_candidates?.filter(candidate => candidate.source_media_id === selectedSourceId).length ?? 0;
-  const unsavedCandidates = activeCandidates.filter(candidate => !project.events.some(event => matchesCandidate(event, candidate)))
+  const allCandidates = project.sources.flatMap(source => candidatesBySource[source.media_id] ?? []);
+  const allActiveCandidates = allCandidates.filter(candidate => !isDismissedCandidate(project, candidate));
+  const selectedActiveCandidates = (candidatesBySource[selectedSourceId] ?? []).filter(candidate => !isDismissedCandidate(project, candidate));
+  const activeCandidates = project.sources.length > 1 && candidateFilter === 'all' ? allActiveCandidates : selectedActiveCandidates;
+  const dismissedCount = project.dismissed_kill_candidates?.filter(candidate =>
+    project.sources.length > 1 && candidateFilter === 'all'
+      ? project.sources.some(source => source.media_id === candidate.source_media_id)
+      : candidate.source_media_id === selectedSourceId,
+  ).length ?? 0;
+  const sortCandidates = (list: KillCandidate[]) => list
+    .filter(candidate => !project.events.some(event => matchesCandidate(event, candidate)))
     .sort((a, b) => (aiReviewOrder.get(a.candidate_id)?.index ?? aiKillReviews.length) - (aiReviewOrder.get(b.candidate_id)?.index ?? aiKillReviews.length));
-  const candidateToReview = activeCandidates.find(candidate => candidate.candidate_id === reviewShot?.candidateId);
-  const observedKills = [...project.events, ...activeCandidates];
+  const allUnsavedCount = allActiveCandidates.filter(candidate => !project.events.some(event => matchesCandidate(event, candidate))).length;
+  const selectedUnsavedCount = selectedActiveCandidates.filter(candidate => !project.events.some(event => matchesCandidate(event, candidate))).length;
+  const unsavedCandidates = sortCandidates(activeCandidates);
+  const candidateToReview = allActiveCandidates.find(candidate => candidate.candidate_id === reviewShot?.candidateId);
+  const observedKills = [...project.events, ...allActiveCandidates];
   const reviewBounds = candidateToReview ? isolatedKillWindow(candidateToReview, observedKills) : null;
   const reviewCandidate = candidateToReview && reviewBounds
     ? { ...candidateToReview, in_us: reviewBounds.inUs, out_us: reviewBounds.outUs } : null;
   const hasAutoKillClips = project.timeline.some(clip => autoKillClipBounds(project, clip) !== null);
   const repairableClips = project.timeline.some(clip => {
-    const bounds = autoKillClipBounds(project, clip, activeCandidates);
+    const bounds = autoKillClipBounds(project, clip, allActiveCandidates);
     return bounds && (clip.in_us < bounds.inUs || clip.out_us > bounds.outUs);
   });
   const selectedClip = project.timeline.find(item => item.clip_id === selectedClipId) ?? null;
@@ -407,43 +428,91 @@ export default function App() {
     setEventOut(asInput(Math.min(selectedSource.duration_us, killUs + 1_500_000)));
   }
 
-  async function detectKillCandidates(useAI = false) {
-    if (!selectedSource) return setNotice({ kind: 'error', text: 'Pilih rekaman sebelum mencari kandidat kill.' });
+  async function detectKillCandidates(useAI = false, scope: 'all' | 'selected' = 'selected') {
+    const targets = scope === 'all'
+      ? projectRef.current.sources.filter(source => !missingMediaPaths.includes(source.path))
+      : selectedSource && !missingMediaPaths.includes(selectedSource.path) ? [selectedSource] : [];
+    if (!targets.length) return setNotice({ kind: 'error', text: 'Pilih rekaman sebelum mencari kandidat kill.' });
     if (useAI && (!aiCanPlan || !aiState || aiUsageCount >= MAX_AI_REQUESTS_PER_PROJECT)) return;
-    if (useAI && !window.confirm(`Pakai ${modelLabel} untuk meninjau kandidat? Studio hanya mengirim timestamp, skor, dan jenis sinyal deteksi. Video dan audio tetap lokal. Tinjauan memakai satu jatah AI proyek jika ada kandidat baru.`)) return;
-    const sourceId = selectedSource.media_id;
+    if (useAI && !window.confirm(`Pindai ${targets.length} rekaman secara lokal lalu urutkan kandidat memakai ${modelLabel}? Studio hanya mengirim timestamp, skor, dan jenis sinyal deteksi. Video dan audio tetap lokal. Tinjauan memakai satu jatah AI proyek jika ada kandidat baru.`)) return;
     const projectId = project.project_id;
     const model = aiState?.selectedModel;
+    cancelScanRef.current = false;
     setAIKillReviews([]);
-    setBusy('Menganalisis kandidat kill secara lokal'); setNotice(null);
+    setNotice(null);
+    if (targets.length > 1) setCandidateFilter('all');
+    const collectedBySource: Record<string, KillCandidate[]> = { ...candidatesBySource };
+    let scannedCount = 0;
+    let clipsWithKills = 0;
+    let failedClips = 0;
+    let lastError = '';
     try {
-      const result = await window.vms.detectKills(selectedSource);
-      if (!projectRef.current.sources.some(source => source.media_id === sourceId)) return;
-      setKillCandidates(result.candidates);
-      const pending = result.candidates.filter(candidate => !isDismissedCandidate(projectRef.current, candidate)
+      for (let index = 0; index < targets.length; index++) {
+        if (cancelScanRef.current || projectRef.current.project_id !== projectId) break;
+        const source = targets[index];
+        setScanProgress({ current: index + 1, total: targets.length, filename: source.filename });
+        setBusy(targets.length > 1 ? `Memindai rekaman ${index + 1}/${targets.length}` : 'Menganalisis kandidat kill secara lokal');
+        try {
+          const result = await window.vms.detectKills(source);
+          if (projectRef.current.project_id !== projectId) return;
+          if (!projectRef.current.sources.some(item => item.media_id === source.media_id)) continue;
+          collectedBySource[source.media_id] = result.candidates;
+          setCandidatesBySource(prev => ({ ...prev, [source.media_id]: result.candidates }));
+          scannedCount += 1;
+          if (result.candidates.length > 0) clipsWithKills += 1;
+        } catch (error) {
+          failedClips += 1;
+          lastError = getError(error);
+          if (targets.length === 1) throw error;
+        }
+      }
+      setScanProgress(null);
+      const scannedCandidates = targets.flatMap(source => collectedBySource[source.media_id] ?? []);
+      const pending = scannedCandidates.filter(candidate => !isDismissedCandidate(projectRef.current, candidate)
         && !projectRef.current.events.some(event => matchesCandidate(event, candidate)));
-      if (useAI && model && pending.length) {
+      if (useAI && model && pending.length && !cancelScanRef.current) {
         setBusy('AI sedang meninjau metadata kandidat');
         try {
-          const review = await window.vms.aiReviewKills(projectId, model, pending);
+          const batch = pending.slice(0, 250);
+          const review = await window.vms.aiReviewKills(projectId, model, batch);
           setAIKillReviews(review.reviews);
           setAIUsageCount(review.usageCount);
-          setNotice({ kind: 'success', text: `AI memprioritaskan ${pending.length} kandidat. Putar cuplikan sebelum mengonfirmasi.` });
+          setNotice({
+            kind: 'success',
+            text: `AI memprioritaskan ${batch.length} kandidat dari ${clipsWithKills}/${scannedCount} rekaman (Jatah AI proyek: ${review.usageCount}/${MAX_AI_REQUESTS_PER_PROJECT}). Video tetap lokal; hanya metadata singkat yang dikirim ke ChatGPT.`,
+          });
         } catch (error) {
           await refreshAIRequestCount(projectId);
-          setNotice({ kind: 'info', text: `Tinjauan AI gagal (${getError(error)}). Kandidat dari pemindaian lokal tetap tersedia.` });
+          setNotice({ kind: 'info', text: `Tinjauan AI gagal (${getError(error)}). ${pending.length} kandidat dari pemindaian lokal tetap tersedia.` });
         }
         return;
       }
-      setNotice({ kind: 'success', text: pending.length ? `${pending.length} kandidat siap ditinjau.`
-        : 'Pemindaian selesai. Tidak ada kandidat baru untuk ditinjau.' });
+      if (cancelScanRef.current) {
+        setNotice({ kind: 'info', text: `Pemindaian dihentikan setelah ${scannedCount}/${targets.length} rekaman. ${pending.length} kandidat tersimpan untuk ditinjau.` });
+      } else if (pending.length) {
+        setNotice({
+          kind: 'success',
+          text: targets.length > 1
+            ? `${pending.length} kandidat siap ditinjau dari ${clipsWithKills}/${scannedCount} rekaman${failedClips ? ` (${failedClips} gagal)` : ''}.`
+            : `${pending.length} kandidat siap ditinjau.`,
+        });
+      } else if (failedClips && scannedCount === 0) {
+        setNotice({ kind: 'error', text: lastError || 'Pemindaian gagal untuk semua rekaman.' });
+      } else {
+        setNotice({
+          kind: 'info',
+          text: targets.length > 1
+            ? `Pemindaian ${scannedCount} rekaman selesai. Tidak ada kandidat baru ditemukan${failedClips ? ` (${failedClips} gagal)` : ''}.`
+            : 'Pemindaian selesai. Tidak ada kandidat baru untuk ditinjau.',
+        });
+      }
     } catch (error) { setNotice({ kind: 'error', text: getError(error) }); }
-    finally { setBusy(''); }
+    finally { setScanProgress(null); setBusy(''); }
   }
 
   function confirmKillCandidate(candidate: KillCandidate) {
     if (isDismissedCandidate(projectRef.current, candidate) || projectRef.current.events.some(event => matchesCandidate(event, candidate))) return;
-    const { inUs, outUs } = isolatedKillWindow(candidate, [...projectRef.current.events, ...activeCandidates]);
+    const { inUs, outUs } = isolatedKillWindow(candidate, [...projectRef.current.events, ...allActiveCandidates]);
     const event: HighlightEvent = {
       event_id: uuid(), source_media_id: candidate.source_media_id, source_time_us: candidate.source_time_us,
       source_frame: candidate.source_frame, in_us: inUs, out_us: outUs,
@@ -464,6 +533,7 @@ export default function App() {
 
   function showKillCandidate(candidate: KillCandidate) {
     setPreviewRenderUrl('');
+    setSelectedSourceId(candidate.source_media_id);
     setReviewShot({
       sourceId: candidate.source_media_id,
       timeUs: candidate.source_time_us,
@@ -504,7 +574,7 @@ export default function App() {
       const clip = makeClip(draft, event);
       clipId = clip.clip_id;
       draft.timeline.push(clip);
-      trimOverlappingAutoKillClips(draft, event.source_media_id, activeCandidates);
+      trimOverlappingAutoKillClips(draft, event.source_media_id, allActiveCandidates);
       delete draft.reference_draft;
     });
     setSelectedClipId(clipId);
@@ -628,7 +698,7 @@ export default function App() {
     commit(draft => {
       const clip = draft.timeline.find(item => item.clip_id === selectedClip.clip_id);
       if (!clip) return;
-      const bounds = autoKillClipBounds(draft, clip, activeCandidates);
+      const bounds = autoKillClipBounds(draft, clip, allActiveCandidates);
       const inUs = field === 'in_us' ? Math.max(bounds?.inUs ?? selectedEvent.in_us, Math.min(value, earliestIncludedImpact)) : clip.in_us;
       const outUs = field === 'out_us' ? Math.min(bounds?.outUs ?? selectedEvent.out_us, Math.max(value, latestIncludedImpact)) : clip.out_us;
       if (inUs >= outUs) return;
@@ -891,21 +961,36 @@ export default function App() {
           </div>
 
           <div className="section-head highlight-heading"><h2>Review kill</h2><span className="count-pill">{project.events.length}</span></div>
-          {selectedSource && !missingMediaPaths.includes(selectedSource.path) ? <>
+          {availableSources.length > 0 && selectedSource ? <>
             <p className="workflow-help">{workerState?.upstream?.kill_detection ? 'Cari kandidat kill, lalu putar cuplikannya dan cek kill feed sebelum mengonfirmasi.' : 'Putar rekaman, lalu tandai kill yang ingin kamu masukkan ke montage.'}</p>
             <div className="highlight-actions">
-              {workerState?.upstream?.kill_detection && <button className="button primary" onClick={() => void detectKillCandidates()} disabled={Boolean(busy)}>Cari kill otomatis</button>}
-              <button className="button subtle" onClick={() => void detectKillCandidates(true)}
-                disabled={Boolean(busy) || !workerState?.upstream?.kill_detection || !aiCanPlan || Boolean(aiState?.aiBusy) || aiUsageCount >= MAX_AI_REQUESTS_PER_PROJECT}>
-                Pindai lokal + urutkan via AI (metadata)
-              </button>
+              {workerState?.upstream?.kill_detection && (availableSources.length > 1
+                ? <>
+                  <button className="button primary" onClick={() => void detectKillCandidates(false, 'all')} disabled={Boolean(busy)}>Cari kill di semua rekaman ({availableSources.length})</button>
+                  <button className="button subtle" onClick={() => void detectKillCandidates(true, 'all')}
+                    disabled={Boolean(busy) || !aiCanPlan || Boolean(aiState?.aiBusy) || aiUsageCount >= MAX_AI_REQUESTS_PER_PROJECT}>
+                    Pindai semua + urutkan via AI (metadata)
+                  </button>
+                  {!missingMediaPaths.includes(selectedSource.path) && <button className="button subtle" onClick={() => void detectKillCandidates(false, 'selected')} disabled={Boolean(busy)}>Pindai rekaman dipilih saja</button>}
+                </>
+                : <>
+                  <button className="button primary" onClick={() => void detectKillCandidates(false, 'selected')} disabled={Boolean(busy)}>Cari kill otomatis</button>
+                  <button className="button subtle" onClick={() => void detectKillCandidates(true, 'selected')}
+                    disabled={Boolean(busy) || !aiCanPlan || Boolean(aiState?.aiBusy) || aiUsageCount >= MAX_AI_REQUESTS_PER_PROJECT}>
+                    Pindai lokal + urutkan via AI (metadata)
+                  </button>
+                </>)}
               {!aiCanPlan && <p className="workflow-help">Opsional: hubungkan ChatGPT di Director untuk mengurutkan metadata kandidat lokal (video &amp; audio tetap di perangkat).</p>}
-              {aiCanPlan && aiUsageCount < MAX_AI_REQUESTS_PER_PROJECT && <p className="workflow-help">AI hanya mengurutkan skor metadata lokal, bukan mendeteksi video. Jatah AI proyek: {aiUsageCount}/{MAX_AI_REQUESTS_PER_PROJECT}.</p>}
+              {aiCanPlan && aiUsageCount < MAX_AI_REQUESTS_PER_PROJECT && <p className="workflow-help">Deteksi video 100% lokal; AI hanya mengurutkan skor metadata (pemakaian kuota ChatGPT sangat kecil). Jatah AI proyek: {aiUsageCount}/{MAX_AI_REQUESTS_PER_PROJECT}.</p>}
               {aiCanPlan && aiUsageCount >= MAX_AI_REQUESTS_PER_PROJECT && <p className="workflow-help">Jatah AI proyek habis ({aiUsageCount}/{MAX_AI_REQUESTS_PER_PROJECT}). Pencarian lokal tetap tersedia.</p>}
-              {busy === 'Menganalisis kandidat kill secara lokal' && <div className="inline-activity" role="status"><span className="spinner" aria-hidden="true" /><span>Memindai rekaman lokal… ({String(Math.floor(busyElapsedSec / 60)).padStart(2, '0')}:{String(busyElapsedSec % 60).padStart(2, '0')})</span></div>}
+              {scanProgress && <div className="inline-activity" role="status">
+                <span className="spinner" aria-hidden="true" />
+                <span>{scanProgress.total > 1 ? `Memindai ${scanProgress.current}/${scanProgress.total}: ${scanProgress.filename}` : `Memindai ${scanProgress.filename}…`} ({String(Math.floor(busyElapsedSec / 60)).padStart(2, '0')}:{String(busyElapsedSec % 60).padStart(2, '0')})</span>
+              </div>}
+              {scanProgress && scanProgress.total > 1 && <button className="button subtle" onClick={() => { cancelScanRef.current = true; setNotice({ kind: 'info', text: 'Menghentikan pemindaian setelah rekaman saat ini selesai…' }); }}>Hentikan pemindaian</button>}
               {busy === 'AI sedang meninjau metadata kandidat' && <div className="inline-activity" role="status"><span className="spinner" aria-hidden="true" /><span>AI sedang mengurutkan metadata kandidat…</span></div>}
               {busy === 'AI sedang meninjau metadata kandidat' && aiState?.aiBusy && <button className="button subtle" onClick={() => void cancelAIRequest()}>Batalkan tinjauan AI</button>}
-              <button className="button subtle" aria-expanded={manualMarking} aria-controls={manualMarking ? 'manual-highlight' : undefined} onClick={() => {
+              <button className="button subtle" aria-expanded={manualMarking} aria-controls={manualMarking ? 'manual-highlight' : undefined} disabled={missingMediaPaths.includes(selectedSource.path)} onClick={() => {
                 if (!manualMarking) {
                   setPreviewRenderUrl('');
                   if (previewSource?.media_id !== selectedSource.media_id || (selectedClip && !reviewShot)) {
@@ -946,22 +1031,31 @@ export default function App() {
           </div>
           {dismissedCount > 0 && <button className="button subtle compact" disabled={Boolean(busy)} onClick={() => {
             commit(draft => {
-              draft.dismissed_kill_candidates = draft.dismissed_kill_candidates?.filter(candidate => candidate.source_media_id !== selectedSourceId);
+              draft.dismissed_kill_candidates = project.sources.length > 1 && candidateFilter === 'all'
+                ? []
+                : draft.dismissed_kill_candidates?.filter(candidate => candidate.source_media_id !== selectedSourceId);
             });
-            setNotice({ kind: 'info', text: killCandidates.length ? 'Kandidat untuk rekaman ini ditampilkan kembali.' : 'Jalankan Cari kill otomatis untuk meninjau kandidat lagi.' });
+            setNotice({ kind: 'info', text: allCandidates.length ? 'Kandidat ditampilkan kembali.' : 'Jalankan pencarian kill untuk meninjau kandidat lagi.' });
           }}>Tampilkan kembali kandidat ({dismissedCount})</button>}
-          {unsavedCandidates.length > 0 && <section className="candidate-panel" aria-labelledby="candidate-heading">
+          {(allUnsavedCount > 0 || unsavedCandidates.length > 0) && <section className="candidate-panel" aria-labelledby="candidate-heading">
             <div className="candidate-title">
               <h3 id="candidate-heading">Kandidat kill ({unsavedCandidates.length})</h3>
+              {project.sources.length > 1 && <div className="candidate-filter" role="tablist" aria-label="Filter kandidat rekaman">
+                <button className={`filter-pill ${candidateFilter === 'all' ? 'active' : ''}`} role="tab" aria-selected={candidateFilter === 'all'} onClick={() => setCandidateFilter('all')}>Semua ({allUnsavedCount})</button>
+                <button className={`filter-pill ${candidateFilter === 'selected' ? 'active' : ''}`} role="tab" aria-selected={candidateFilter === 'selected'} onClick={() => setCandidateFilter('selected')}>Rekaman ini ({selectedUnsavedCount})</button>
+              </div>}
               {aiKillReviews.length > 0 && <p>Urutan saran AI berdasarkan metadata. Cek cuplikan untuk memastikan kill.</p>}
               <p>Putar cuplikan dan cek nama pemain di kill feed sebelum menyimpan highlight.</p>
             </div>
+            {unsavedCandidates.length === 0 && <p className="candidate-empty">Tidak ada kandidat belum disimpan untuk rekaman yang dipilih. Klik “Semua ({allUnsavedCount})” untuk melihat hasil dari rekaman lain.</p>}
             {unsavedCandidates.map(candidate => {
               const time = timecode(candidate.source_time_us);
               const active = reviewShot?.candidateId === candidate.candidate_id;
               const review = aiReviewOrder.get(candidate.candidate_id);
+              const candidateSource = project.sources.find(item => item.media_id === candidate.source_media_id);
               return <article className={`candidate-card ${active ? 'reviewing' : ''}`} key={candidate.candidate_id}>
                 <h4>Kill sekitar {time}</h4>
+                {project.sources.length > 1 && candidateSource && <small className="candidate-source" title={candidateSource.filename}>{candidateSource.filename}</small>}
                 {review && <p>{review.priority === 'prioritize' ? 'Prioritas AI' : 'Perlu cek ulang'}</p>}
                 <p>{candidate.requires_ownership_review
                   ? 'Kandidat dari replay. Pastikan itu kill milikmu.'
@@ -1054,7 +1148,7 @@ export default function App() {
                     setNotice({ kind: 'info', text: 'Batas klip kill otomatis sudah rapi. Pilih klip untuk meninjau cuplikannya.' });
                     return;
                   }
-                  commit(draft => trimOverlappingAutoKillClips(draft, undefined, activeCandidates));
+                  commit(draft => trimOverlappingAutoKillClips(draft, undefined, allActiveCandidates));
                   setNotice({ kind: 'success', text: 'Batas klip dirapikan supaya kill tetangga tidak terulang. Ctrl+Z untuk membatalkan.' });
                 }}>Rapikan kill berulang</button>}
               </div>
@@ -1254,12 +1348,15 @@ export default function App() {
       {busy && !(busy === 'Rendering' && renderJob) && <div className="render-dock activity-dock" role="status" aria-live="polite">
         <span className="spinner" aria-hidden="true" />
         <div className="render-copy">
-          <span className="eyebrow">{busy === 'Planning upstream montage' ? 'UPSTREAM DRAFT' : busy === 'Menganalisis kandidat kill secara lokal' ? 'PEMINDAIAN LOKAL' : busy === 'AI sedang meninjau metadata kandidat' || busy === 'Membuat draft ChatGPT' || busy === 'Memeriksa koneksi ChatGPT' ? 'TINJAUAN AI' : 'MEMPROSES'}</span>
-          <strong>{busy === 'Planning upstream montage' ? 'Mendeteksi shot dan menyusun draft pada beat lagu…' : `${busy}…`}</strong>
-          {busy === 'Menganalisis kandidat kill secara lokal' && <small className="activity-sub">Proses video 100% lokal (1080p VFR butuh 1–3 menit). AI baru dipanggil setelah pemindaian lokal selesai.</small>}
+          <span className="eyebrow">{busy === 'Planning upstream montage' ? 'UPSTREAM DRAFT' : scanProgress ? 'PEMINDAIAN LOKAL' : busy === 'AI sedang meninjau metadata kandidat' || busy === 'Membuat draft ChatGPT' || busy === 'Memeriksa koneksi ChatGPT' ? 'TINJAUAN AI' : 'MEMPROSES'}</span>
+          <strong>{busy === 'Planning upstream montage' ? 'Mendeteksi shot dan menyusun draft pada beat lagu…' : scanProgress ? (scanProgress.total > 1 ? `Memindai rekaman ${scanProgress.current}/${scanProgress.total}: ${scanProgress.filename}` : `Memindai rekaman: ${scanProgress.filename}`) : `${busy}…`}</strong>
+          {scanProgress && <small className="activity-sub">Proses video 100% lokal (~30–60 dtk per rekaman 1080p VFR). Hasil langsung muncul di panel Review kill saat tiap rekaman selesai.</small>}
         </div>
-        <div className="progress-track indeterminate" aria-hidden="true"><i /></div>
+        {scanProgress && scanProgress.total > 1
+          ? <div className="progress-track" aria-hidden="true"><i style={{ width: `${Math.max(8, Math.round((scanProgress.current / scanProgress.total) * 100))}%` }} /></div>
+          : <div className="progress-track indeterminate" aria-hidden="true"><i /></div>}
         <b className="activity-timer">{String(Math.floor(busyElapsedSec / 60)).padStart(2, '0')}:{String(busyElapsedSec % 60).padStart(2, '0')}</b>
+        {scanProgress && scanProgress.total > 1 && <button className="button subtle compact" onClick={() => { cancelScanRef.current = true; setNotice({ kind: 'info', text: 'Menghentikan pemindaian setelah rekaman saat ini selesai…' }); }}>Hentikan</button>}
         {aiState?.aiBusy && <button className="button subtle compact" onClick={() => void cancelAIRequest()}>Batalkan</button>}
       </div>}
       {busy === 'Rendering' && renderJob && <div className="render-dock"><div className="render-copy"><span className="eyebrow">{renderMode === 'master' ? 'EXPORTING MASTER' : renderMode === 'rough_preview' ? 'RENDERING ROUGH PREVIEW' : 'RENDERING EFFECTS PREVIEW'}</span><strong>{renderJob.message}</strong></div><div className="progress-track"><i style={{ width: `${Math.round(renderJob.progress * 100)}%` }} /></div><b>{Math.round(renderJob.progress * 100)}%</b><button className="button subtle compact" onClick={() => void cancelRender()}>Cancel</button></div>}

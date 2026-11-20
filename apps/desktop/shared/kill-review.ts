@@ -29,6 +29,17 @@ export function killReviewMetadata(candidates: KillCandidate[]) {
   }) };
 }
 
+export function parseJsonOnly(text: string): unknown {
+  let trimmed = text.trim();
+  const fenced = /^```(?:json)?\s*\r?\n([\s\S]*?)\r?\n```$/i.exec(trimmed);
+  if (fenced) trimmed = fenced[1].trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    throw new Error('The response was not valid JSON.');
+  }
+}
+
 export function validateKillReview(value: unknown, candidates: KillCandidate[]): AIKillReview[] {
   const reviews = (value as { reviews?: unknown })?.reviews;
   if (!Array.isArray(reviews) || reviews.length !== candidates.length) throw new Error('Tinjauan AI tidak memuat daftar kandidat yang lengkap.');

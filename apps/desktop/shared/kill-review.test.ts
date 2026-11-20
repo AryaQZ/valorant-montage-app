@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { KillCandidate } from './bridge.js';
-import { killReviewMetadata, validateKillReview } from './kill-review.js';
+import { killReviewMetadata, parseJsonOnly, validateKillReview } from './kill-review.js';
 import { isolatedKillWindow } from './project.js';
 
 const candidate: KillCandidate = {
@@ -37,6 +37,16 @@ describe('AI kill review', () => {
       expect(() => validateKillReview({ reviews: [{ index: 0, priority: 'prioritize' }, { index, priority: 'check_again' }] }, candidates)).toThrow();
     }
     expect(() => validateKillReview({ reviews: [{ index: 0, priority: 'prioritize' }] }, candidates)).toThrow();
+  });
+
+  it('parses raw JSON and strips optional markdown json fences while rejecting prose', () => {
+    expect(parseJsonOnly('{"reviews":[{"index":0,"priority":"prioritize"}]}')).toEqual({
+      reviews: [{ index: 0, priority: 'prioritize' }],
+    });
+    expect(parseJsonOnly('```json\n{"reviews":[{"index":0,"priority":"prioritize"}]}\n```')).toEqual({
+      reviews: [{ index: 0, priority: 'prioritize' }],
+    });
+    expect(() => parseJsonOnly('Here is the JSON:\n{"reviews":[]}')).toThrow();
   });
 });
 

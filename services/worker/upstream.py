@@ -267,6 +267,149 @@ def _nearest_source_frame(timestamps: list[float], time_us: int, fallback_frame:
     return nearest, "ffprobe_packet_pts"
 
 
+def _first_video_pts(path: Path) -> float:
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0.0
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,dts_time",
+             "-of", "csv=p=0", "-read_intervals", "%+#8", str(path)],
+            capture_output=True, text=True, timeout=60, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0.0
+    values: list[float] = []
+    for line in result.stdout.splitlines():
+        for field in line.strip().split(",")[:2]:
+            try:
+                values.append(float(field))
+                break
+            except ValueError:
+                continue
+    return min(values) if values else 0.0
+
+
+def _fast_cfr_ingest(path: Path, work: Path) -> None:
+    """Create a 1920x1080 60fps CFR working copy via FFmpeg without invoking RIFE.
+
+    Upstream ingest.py forces RIFE interpolation on every frame whenever source FPS < 59.5,
+    which takes 5-15 minutes per clip or fails completely on machines without Vulkan RIFE.
+    Kill-feed / shot review only needs a 60fps CFR grid aligned to first video packet PTS t0;
+    final slow-motion rendering still uses original timestamps or exact RIFE normalization.
+    """
+    src_dir = work / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    dst = src_dir / "c1.mkv"
+    manifest = src_dir / "ingest.json"
+    if dst.is_file() and dst.stat().st_size > 0 and manifest.is_file():
+        return
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise MediaToolError("FFmpeg diperlukan untuk menyiapkan rekaman sebelum deteksi kill.")
+    part = src_dir / "_c1_fast.part.mkv"
+    try:
+        if part.exists():
+            part.unlink()
+    except OSError:
+        pass
+    first_pts = _first_video_pts(path)
+    vf = (
+        "fps=60,"
+        "scale=1920:1080:flags=lanczos,"
+        "scale=out_color_matrix=bt709:out_range=tv,"
+        "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv,"
+        "format=yuv420p"
+    )
+    command = [
+        ffmpeg, "-nostdin", "-v", "error", "-y", "-i", str(path),
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-g", "60",
+        "-c:a", "flac",
+        "-f", "matroska", str(part),
+    ]
+    try:
+        result = subprocess.run(
+            command, cwd=work, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60 * 60, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise MediaToolError("Persiapan CFR 60fps melewati batas waktu.") from exc
+    except OSError as exc:
+        raise MediaToolError(f"Tidak dapat menjalankan FFmpeg untuk persiapan CFR: {type(exc).__name__}.") from exc
+    if result.returncode != 0 or not part.is_file() or part.stat().st_size == 0:
+        detail = "\n".join((result.stdout + "\n" + result.stderr).splitlines()[-8:]).strip()
+        raise MediaToolError(f"Persiapan CFR 60fps untuk deteksi kill gagal ({result.returncode}). {detail[-1000:]}")
+    os.replace(part, dst)
+    manifest.write_text(
+        json.dumps({"c1": {"t0": first_pts, "method": "fast_cfr_ffmpeg", "path": str(path)}},
+                   ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _prepare_kill_scan_input(python: str, path: Path, media: dict[str, Any], work: Path) -> None:
+    source_rate = media.get("video", {}).get("avg_frame_rate") or (60, 1)
+    if not isinstance(source_rate, (list, tuple)) or len(source_rate) != 2 or not source_rate[1]:
+        source_fps = 60.0
+    else:
+        source_fps = float(source_rate[0]) / max(1.0, float(source_rate[1]))
+    if source_fps < 59.5:
+        _fast_cfr_ingest(path, work)
+        return
+    try:
+        _run(python, UPSTREAM_SCRIPTS / "ingest.py", ["--fast"], work, 60 * 60)
+    except MediaToolError:
+        _fast_cfr_ingest(path, work)
+
+
+def _candidate_rank(candidate: dict[str, Any]) -> tuple[int, float, float, int]:
+    evidence = (candidate.get("evidence") or [{}])[0]
+    rank_score = (evidence.get("kill_rank") or {}).get("score")
+    score = float(rank_score) if isinstance(rank_score, (int, float)) else 0.0
+    return (
+        1 if candidate.get("verified_by_upstream") else 0,
+        float(candidate.get("confidence", 0.0)),
+        score,
+        -int(candidate.get("source_time_us", 0)),
+    )
+
+
+def _deduplicate_candidates(candidates: list[dict[str, Any]], *,
+                            shot_gap_frames: int = 15, feed_gap_frames: int = 6) -> list[dict[str, Any]]:
+    """Collapse duplicate detections pointing to the same kill (e.g., scrolled feed rows)."""
+    ordered = sorted(candidates, key=lambda item: (int(item["source_time_us"]), item["candidate_id"]))
+    kept: list[dict[str, Any]] = []
+    for candidate in ordered:
+        ev = (candidate.get("evidence") or [{}])[0]
+        k = ev.get("working_frame_60")
+        feed = candidate.get("feed_frame")
+        dup_index: int | None = None
+        for idx, existing in enumerate(kept):
+            if existing["source_media_id"] != candidate["source_media_id"]:
+                continue
+            ex_ev = (existing.get("evidence") or [{}])[0]
+            ex_k = ex_ev.get("working_frame_60")
+            ex_feed = existing.get("feed_frame")
+            same_shot = (
+                isinstance(k, int) and isinstance(ex_k, int) and abs(k - ex_k) <= shot_gap_frames
+            ) or abs(int(candidate["source_time_us"]) - int(existing["source_time_us"])) <= round(shot_gap_frames * 1_000_000 / 60.0)
+            same_feed = (
+                isinstance(feed, int) and isinstance(ex_feed, int) and abs(feed - ex_feed) <= feed_gap_frames
+            )
+            if same_shot or same_feed:
+                dup_index = idx
+                break
+        if dup_index is None:
+            kept.append(candidate)
+        elif _candidate_rank(candidate) > _candidate_rank(kept[dup_index]):
+            kept[dup_index] = candidate
+    return sorted(kept, key=lambda item: (int(item["source_time_us"]), item["candidate_id"]))
+
+
 def detect_kills(path_value: str, source_media_id: str, duration_us: int | None) -> dict[str, Any]:
     """Run original Valorant feed/shot detection and return review-only event candidates."""
     python = upstream_python()
@@ -281,12 +424,11 @@ def detect_kills(path_value: str, source_media_id: str, duration_us: int | None)
     work.mkdir(parents=True, exist_ok=True)
     clips_path = work / "clips.json"
     clips_path.write_text(json.dumps({"c1": str(path)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    # Kill review needs the original 60 fps timeline, but not the expensive
-    # exact RIFE reconstruction for every source frame. Upstream --fast keeps
-    # that same frame grid, bounds nearest-frame error to half a source frame,
-    # and interpolates only when needed to avoid repeating a source frame.
-    # Final montage rendering still reads the original timestamped source.
-    _run(python, UPSTREAM_SCRIPTS / "ingest.py", ["--fast"], work, 60 * 60)
+    # Kill review needs a 60 fps 1920x1080 working grid, never expensive RIFE
+    # frame interpolation across whole clips. Use upstream --fast for ~60 fps
+    # sources (zero-copy link when conforming), and fast FFmpeg 60fps CFR for
+    # < 59.5 fps VFR recordings so detection finishes in seconds without RIFE.
+    _prepare_kill_scan_input(python, path, media, work)
     _run(python, UPSTREAM_SCRIPTS / "mkpts.py", ["c1"], work, 15 * 60)
     _run(python, UPSTREAM_SCRIPTS / "kills_auto.py", ["valorant", "c1"], work, 60 * 60)
     try:
@@ -410,7 +552,7 @@ def detect_kills(path_value: str, source_media_id: str, duration_us: int | None)
         review_sheet = str(work / f"autokill_{int(key) // 5 + 1:02d}.jpg")
         kverify_sheet = str(review_dir / f"kv_{int(key) // 6 + 1:02d}.jpg") if verification else None
         candidates.append({
-            "candidate_id": f"upstream-c1-{key}",
+            "candidate_id": f"upstream-{source_media_id}-{key}",
             "source_media_id": source_media_id,
             "source_time_us": source_time_us,
             "source_frame": source_frame,
@@ -441,6 +583,7 @@ def detect_kills(path_value: str, source_media_id: str, duration_us: int | None)
                           "suggested_tags": suggested_tags,
                           "review_sheet": review_sheet, "shot_verification_sheet": kverify_sheet}],
         })
+    candidates = _deduplicate_candidates(candidates)
     return {"source_media_id": source_media_id, "candidates": candidates,
             "upstream_commit": UPSTREAM_COMMIT, "candidate_count": len(candidates),
             "status": "needs_user_review", "working_directory": str(work)}
