@@ -57,4 +57,11 @@ Seluruh fase selesai dengan **`exit code 0`** (`artifacts/stage5-rc1/qa-rc1/`):
 
 1. **Mesin/VM Windows bersih (`A01`)**: ulangi instalasi NSIS, deteksi prasyarat tanpa `.build-tools`, dan skenario inti pada profil/VM Windows bersih tanpa lingkungan pengembangan.
 2. **Code signing & lisensi distribusi**: tandatangani installer dengan sertifikat Authenticode untuk distribusi publik dan tinjau cakupan **OpenAI Noncommercial License 1.0** pada `apps/desktop/vendor/siwc-devkit` (`THIRD_PARTY_NOTICES.md`) sebelum distribusi komersial.
-3. **Beta terbatas**: jalankan beta terbatas dengan kandidat `0.1.11-rc.1` (impor, review kill, preview, ekspor, buka ulang proyek) dan catat temuan yang bisa direproduksi.
+3. **Beta terbatas**: jalankan beta terbatas dengan kandidat `0.1.11-rc.2` (impor, review kill, preview, ekspor, buka ulang proyek) dan catat temuan yang bisa direproduksi.
+
+## 5. Pembaruan Kandidat `0.1.11-rc.2` (Python Bundel, Ikon Kustom, & Paket ZIP GitHub)
+
+- **Runtime Python 3.11 dibundel (`scripts/prepare-bundled-python.ps1`, `apps/desktop/electron/worker-python.ts`):** biner `VALORANT Montage Studio.exe` (`0.1.11-rc.2`) diverifikasi meluncur tanpa Python di `PATH` (`PATH = C:\Windows\System32;C:\Windows`) dan dengan `PYTHONHOME` rusak; proses anak `resources\python\python.exe` berjalan otomatis, melayani `GET /v1/capabilities`, lalu berhenti bersih saat aplikasi ditutup (`artifacts/stage5-rc2/bundled-python-evidence.json`).
+- **Banner prasyarat FFmpeg & ikon kustom:** saat FFmpeg tidak ada di `PATH`, `.prereq-banner` tampil jelas (`FFMPEG REQUIRED`, perintah `winget install -e --id Gyan.FFmpeg`, `rootOverflowX = 0`, tombol `Periksa ulang` merespons langsung; `artifacts/stage5-rc2/prereq-banner-evidence.json`). Ikon multi-resolusi `apps/desktop/build/icon.ico` & `icon.png` terpasang tanpa peringatan default icon.
+- **Paket ZIP & GitHub Releases:** `VALORANT-Montage-Studio-0.1.11-rc.2-Windows-x64.zip` (`134.832.886` byte, SHA-256 `F297CF260C6FEE8610CD3C7E16FE44CEA4204874BD8A4B54ABF3E551E2601F11`) dan workflow `.github/workflows/windows-release.yml` disiapkan agar siapa saja dapat mengunduh satu `.zip` dari halaman GitHub Releases, mengekstrak, memasang, dan langsung memakai aplikasi.
+- **Regresi akhir RC2:** **67 tes Python** + `tsc --noEmit` + **24 tes desktop** (termasuk 4 tes baru `electron/worker-python.test.ts`) lulus. Lihat [RELEASE_NOTES_0.1.11-rc.2.md](../RELEASE_NOTES_0.1.11-rc.2.md).

@@ -16,6 +16,7 @@ import { validateAIProposal } from '../shared/director.js';
 import { killReviewMetadata, validateKillReview } from '../shared/kill-review.js';
 import { createElectronCredentialEncryption } from './credential-encryption.js';
 import { requestLocalWorker } from './worker-client.js';
+import { buildWorkerEnv, resolveWorkerPython } from './worker-python.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const isPackaged = app.isPackaged;
@@ -162,10 +163,20 @@ function findCredentialWorker(): Promise<void> {
   const logDirectory = join(app.getPath('userData'), 'logs');
   const workerLog = join(logDirectory, 'worker.log');
   return mkdir(logDirectory, { recursive: true }).then(() => new Promise<void>((resolveReady, rejectReady) => {
-    const python = process.env.VMS_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
-    const child = spawn(python, ['-m', 'services.worker'], {
+    const resolvedPython = resolveWorkerPython({
+      envPython: process.env.VMS_PYTHON,
+      isPackaged,
+      resourcesPath: process.resourcesPath,
+    });
+    const child = spawn(resolvedPython.executable, ['-m', 'services.worker'], {
       cwd: root,
-      env: { ...process.env, PYTHONPATH: root, VMS_DATA_DIR: workerDataDirectory(), VMS_WORKER_PARENT_PID: String(process.pid) },
+      env: buildWorkerEnv({
+        baseEnv: process.env,
+        workerRoot: root,
+        dataDir: workerDataDirectory(),
+        parentPid: process.pid,
+        bundled: resolvedPython.bundled,
+      }),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -917,9 +928,15 @@ async function signInWithChatGPT(options: Parameters<ChatGPTClient['signIn']>[0]
 
 async function createWindow(): Promise<void> {
   const preloadPath = join(here, '../preload/index.cjs');
+  const iconCandidates = [
+    join(process.resourcesPath ?? '', 'icon.png'),
+    join(here, '../../build/icon.png'),
+  ];
+  const windowIcon = iconCandidates.find(candidate => candidate && existsSync(candidate));
   mainWindow = new BrowserWindow({
     width: 1480, height: 940, minWidth: 820, minHeight: 620,
     backgroundColor: '#0d1016', show: false,
+    ...(windowIcon ? { icon: windowIcon } : {}),
     title: `VALORANT Montage Studio · Versi ${app.getVersion()}`,
     webPreferences: { preload: preloadPath, contextIsolation: true, nodeIntegration: false, sandbox: true,
       webSecurity: true, allowRunningInsecureContent: false, spellcheck: false },

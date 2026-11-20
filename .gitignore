@@ -5,6 +5,7 @@ __pycache__/
 artifacts/
 apps/desktop/dist-electron/
 apps/desktop/release/
+apps/desktop/build/python-runtime/
 apps/desktop/vendor/siwc-devkit/packages/*/dist/
 apps/desktop/vendor/siwc-devkit/examples/*/dist/
 *.partial.mp4

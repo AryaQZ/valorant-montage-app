@@ -37,6 +37,7 @@ if (!$env:VMS_UPSTREAM_PYTHON -and (Test-Path -LiteralPath $upstreamPython)) { $
 $before = Get-FileHash -LiteralPath @($game, $song)
 Push-Location $desktop
 try {
+    Invoke-Logged { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'prepare-bundled-python.ps1') } "$root/python-runtime.log" 'Bundled Python preparation failed.'
     Invoke-Logged { & npm.cmd run build } "$root/build.log" 'Build failed.'
     Invoke-Logged { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts/test.ps1') } "$root/tests.log" 'Tests failed.'
     Set-Location -LiteralPath $desktop

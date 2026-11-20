@@ -839,6 +839,28 @@ export default function App() {
         </div>
       </header>
 
+      {workerState && !capabilitiesReady && <div className="prereq-banner" role="alert">
+        <div>
+          <strong>FFmpeg &amp; FFprobe diperlukan untuk impor dan ekspor video.</strong>
+          <span>Runtime Python sudah terpasang otomatis di Studio. Pasang FFmpeg lewat PowerShell: <code>winget install -e --id Gyan.FFmpeg</code> (atau jalankan <code>Install-FFmpeg.bat</code>), lalu mulai ulang Studio.</span>
+        </div>
+        <div className="prereq-actions">
+          <button className="button subtle compact" onClick={() => {
+            void navigator.clipboard?.writeText('winget install -e --id Gyan.FFmpeg').then(
+              () => setNotice({ kind: 'info', text: 'Perintah winget FFmpeg disalin. Jalankan di PowerShell lalu mulai ulang Studio.' }),
+              () => setNotice({ kind: 'info', text: 'Jalankan di PowerShell: winget install -e --id Gyan.FFmpeg' }),
+            );
+          }}>Salin perintah</button>
+          <button className="button subtle compact" onClick={() => {
+            void window.vms.getWorkerState().then(state => {
+              setWorkerState(state);
+              setNotice({ kind: state.media.available ? 'success' : 'info',
+                text: state.media.available ? 'FFmpeg terdeteksi dan siap digunakan.' : (state.media.diagnostic || 'FFmpeg belum ditemukan di PATH. Mulai ulang Studio setelah pemasangan.') });
+            }).catch(error => setNotice({ kind: 'error', text: getError(error) }));
+          }}>Periksa ulang</button>
+        </div>
+      </div>}
+
       <div className="workspace">
         <aside className="library-column">
           <div className="section-head"><h2>Rekaman gameplay</h2><span className="count-pill">{project.sources.length}</span></div>
