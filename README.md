@@ -17,7 +17,7 @@ Proses video, deteksi kandidat kill, sinkronisasi beat musik, efek impact, dan l
 
 ---
 
-## Fitur Utama (`0.1.11-rc.2`)
+## Fitur Utama (`0.1.11-rc.3`)
 
 - **100% Lokal & Non-Destruktif:** Rekaman gameplay dan musik tetap di perangkat Anda; proyek disimpan sebagai JSON tervalidasi dengan autosave otomatis, pemulihan crash, dan relink media hilang.
 - **Review Kill & Timeline:** Deteksi kandidat kill lokal atau penandaan manual, preview cuplikan terisolasi, tombol **Abaikan** kandidat ekstra, urutan klip drag-and-drop, trim, speed ramp, reverse replay, serta pemeliharaan ancang-ancang kill terakhir dan banner **ACE**.
@@ -47,7 +47,7 @@ Proses video, deteksi kandidat kill, sinkronisasi beat musik, efek impact, dan l
 ```
 Skrip ini otomatis menyiapkan runtime Python bundel (`scripts\prepare-bundled-python.ps1`), membangun aplikasi Electron, membuat installer NSIS x64, dan mengemas **`VALORANT-Montage-Studio-<versi>-Windows-x64.zip`** beserta `Install-FFmpeg.bat` dan `SHA256SUMS.txt` di `apps\desktop\release\`.
 
-Untuk merilis langsung ke **GitHub Releases**, cukup push tag versi (misalnya `git tag v0.1.11-rc.2 && git push origin v0.1.11-rc.2`) — workflow [windows-release.yml](.github/workflows/windows-release.yml) akan otomatis membangun, menjalankan tes, dan mengunggah file `.zip` & `.exe` ke halaman Releases.
+Untuk merilis langsung ke **GitHub Releases**, cukup push tag versi (misalnya `git tag v0.1.11-rc.3 && git push origin v0.1.11-rc.3`) — workflow [windows-release.yml](.github/workflows/windows-release.yml) akan otomatis membangun, menjalankan tes, dan mengunggah file `.zip` & `.exe` ke halaman Releases.
 
 ---
 

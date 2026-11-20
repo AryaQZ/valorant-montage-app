@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { version } from '../../package.json';
+import appIcon from './assets/app-icon.png';
 import { ChatGPTConnectionCard } from '@siwc/react';
 import '@siwc/react/styles.css';
 import { AI_EFFORTS, MAX_AI_REQUESTS_PER_PROJECT, supportsAIEffort, type AIEffort, type AIKillReview,
@@ -82,6 +83,7 @@ export default function App() {
   const [aiState, setAIState] = useState<AIState | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [busy, setBusy] = useState('');
+  const [busyElapsedSec, setBusyElapsedSec] = useState(0);
   const [manualMarking, setManualMarking] = useState(false);
   const [eventIn, setEventIn] = useState('');
   const [eventImpact, setEventImpact] = useState('');
@@ -108,6 +110,15 @@ export default function App() {
 
   useEffect(() => { document.title = `VALORANT Montage Studio · Versi ${version}`; }, []);
   useEffect(() => { projectRef.current = project; }, [project]);
+  useEffect(() => {
+    if (!busy) { setBusyElapsedSec(0); return; }
+    setBusyElapsedSec(0);
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      setBusyElapsedSec(Math.floor((Date.now() - started) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [busy]);
 
   useEffect(() => {
     let active = true;
@@ -825,7 +836,7 @@ export default function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand-lockup"><div className="brand-mark"><span>V</span></div><div><strong>VALORANT <i>///</i> MONTAGE STUDIO</strong><small className="version-label">Versi {version}</small></div></div>
+        <div className="brand-lockup"><img className="brand-logo" src={appIcon} alt="VALORANT Montage Studio" width={38} height={38} /><div><strong>VALORANT <i>///</i> MONTAGE STUDIO</strong><small className="version-label">Versi {version}</small></div></div>
         <div className="project-name"><span className="live-dot" />{project.name}<small>{saveState}</small></div>
         <div className="top-actions">
           <button className="icon-button" title="Undo (Ctrl+Z)" onClick={undo}>↶</button>
@@ -891,7 +902,8 @@ export default function App() {
               {!aiCanPlan && <p className="workflow-help">Opsional: hubungkan ChatGPT di Director untuk mengurutkan metadata kandidat lokal (video &amp; audio tetap di perangkat).</p>}
               {aiCanPlan && aiUsageCount < MAX_AI_REQUESTS_PER_PROJECT && <p className="workflow-help">AI hanya mengurutkan skor metadata lokal, bukan mendeteksi video. Jatah AI proyek: {aiUsageCount}/{MAX_AI_REQUESTS_PER_PROJECT}.</p>}
               {aiCanPlan && aiUsageCount >= MAX_AI_REQUESTS_PER_PROJECT && <p className="workflow-help">Jatah AI proyek habis ({aiUsageCount}/{MAX_AI_REQUESTS_PER_PROJECT}). Pencarian lokal tetap tersedia.</p>}
-              {busy === 'AI sedang meninjau metadata kandidat' && <p className="workflow-help" role="status">AI sedang meninjau metadata kandidat.</p>}
+              {busy === 'Menganalisis kandidat kill secara lokal' && <div className="inline-activity" role="status"><span className="spinner" aria-hidden="true" /><span>Memindai rekaman lokal… ({String(Math.floor(busyElapsedSec / 60)).padStart(2, '0')}:{String(busyElapsedSec % 60).padStart(2, '0')})</span></div>}
+              {busy === 'AI sedang meninjau metadata kandidat' && <div className="inline-activity" role="status"><span className="spinner" aria-hidden="true" /><span>AI sedang mengurutkan metadata kandidat…</span></div>}
               {busy === 'AI sedang meninjau metadata kandidat' && aiState?.aiBusy && <button className="button subtle" onClick={() => void cancelAIRequest()}>Batalkan tinjauan AI</button>}
               <button className="button subtle" aria-expanded={manualMarking} aria-controls={manualMarking ? 'manual-highlight' : undefined} onClick={() => {
                 if (!manualMarking) {
@@ -1239,7 +1251,17 @@ export default function App() {
         }}>{renderReview === 'preview' ? 'Buat preview draft' : 'Pilih lokasi dan ekspor'}</button></div>
       </dialog>}
       {notice && <div className={`toast ${notice.kind}`} role="status"><span>{notice.kind === 'error' ? '!' : notice.kind === 'success' ? '✓' : 'i'}</span><p>{notice.text}</p><button onClick={() => setNotice(null)}>×</button></div>}
-      {busy === 'Planning upstream montage' && <div className="render-dock" role="status"><div className="render-copy"><span className="eyebrow">UPSTREAM DRAFT</span><strong>Detecting shots and planning against the selected song…</strong></div></div>}
+      {busy && !(busy === 'Rendering' && renderJob) && <div className="render-dock activity-dock" role="status" aria-live="polite">
+        <span className="spinner" aria-hidden="true" />
+        <div className="render-copy">
+          <span className="eyebrow">{busy === 'Planning upstream montage' ? 'UPSTREAM DRAFT' : busy === 'Menganalisis kandidat kill secara lokal' ? 'PEMINDAIAN LOKAL' : busy === 'AI sedang meninjau metadata kandidat' || busy === 'Membuat draft ChatGPT' || busy === 'Memeriksa koneksi ChatGPT' ? 'TINJAUAN AI' : 'MEMPROSES'}</span>
+          <strong>{busy === 'Planning upstream montage' ? 'Mendeteksi shot dan menyusun draft pada beat lagu…' : `${busy}…`}</strong>
+          {busy === 'Menganalisis kandidat kill secara lokal' && <small className="activity-sub">Proses video 100% lokal (1080p VFR butuh 1–3 menit). AI baru dipanggil setelah pemindaian lokal selesai.</small>}
+        </div>
+        <div className="progress-track indeterminate" aria-hidden="true"><i /></div>
+        <b className="activity-timer">{String(Math.floor(busyElapsedSec / 60)).padStart(2, '0')}:{String(busyElapsedSec % 60).padStart(2, '0')}</b>
+        {aiState?.aiBusy && <button className="button subtle compact" onClick={() => void cancelAIRequest()}>Batalkan</button>}
+      </div>}
       {busy === 'Rendering' && renderJob && <div className="render-dock"><div className="render-copy"><span className="eyebrow">{renderMode === 'master' ? 'EXPORTING MASTER' : renderMode === 'rough_preview' ? 'RENDERING ROUGH PREVIEW' : 'RENDERING EFFECTS PREVIEW'}</span><strong>{renderJob.message}</strong></div><div className="progress-track"><i style={{ width: `${Math.round(renderJob.progress * 100)}%` }} /></div><b>{Math.round(renderJob.progress * 100)}%</b><button className="button subtle compact" onClick={() => void cancelRender()}>Cancel</button></div>}
       {completedRender && <div className="qa-dock"><div><span className={`qa-status ${completedRender.qa.status.toLowerCase()}`}>{completedRender.qa.status}</span><strong>{renderMode === 'master' ? 'Export QA' : 'Preview QA'} {completedRender.state === 'needs_review' ? 'needs review' : 'passed'}</strong><small>{completedRender.qa.checks.filter(item => item.status !== 'PASS').length} notes · {completedRender.output_path}</small></div><button className="button subtle compact" onClick={() => void window.vms.revealLocalFile(completedRender.qa_html)}>Open QA report</button><button className="button compact primary" onClick={() => void window.vms.revealLocalFile(completedRender.output_path)}>Open video</button><button className="close-dock" onClick={() => setRenderJob(null)}>×</button></div>}
 
