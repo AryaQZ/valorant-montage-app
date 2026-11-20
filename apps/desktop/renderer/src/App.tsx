@@ -8,6 +8,7 @@ import { applyProposal, autoKillClipBounds, createProject, FPS, isAutoKill, isol
   toggleReverseImpactReplay, type DirectorProposal,
   type Effect, type HighlightEvent, type MediaSource, type Project } from '../../shared/project.js';
 import { buildRuleProposal } from '../../shared/director.js';
+import { isEditableShortcutTarget, resolveGlobalShortcut } from '../../shared/shortcuts.js';
 
 type Notice = { kind: 'error' | 'success' | 'info'; text: string };
 const AI_EFFORT_LABELS: Record<AIEffort, string> = {
@@ -223,10 +224,16 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (!(event.ctrlKey || event.metaKey)) return;
-      if (event.key.toLowerCase() === 'z' && !event.shiftKey) { event.preventDefault(); undo(); }
-      else if (event.key.toLowerCase() === 'y' || (event.key.toLowerCase() === 'z' && event.shiftKey)) { event.preventDefault(); redo(); }
-      else if (event.key.toLowerCase() === 's') { event.preventDefault(); void saveProject(); }
+      const action = resolveGlobalShortcut(event, {
+        busy: Boolean(busy),
+        modalOpen: Boolean(renderReview || document.querySelector('dialog[open]')),
+        editableTarget: isEditableShortcutTarget(event.target) || isEditableShortcutTarget(document.activeElement),
+      });
+      if (!action) return;
+      event.preventDefault();
+      if (action === 'undo') undo();
+      else if (action === 'redo') redo();
+      else if (action === 'save') void saveProject();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
@@ -411,9 +418,9 @@ export default function App() {
           setAIKillReviews(review.reviews);
           setAIUsageCount(review.usageCount);
           setNotice({ kind: 'success', text: `AI memprioritaskan ${pending.length} kandidat. Putar cuplikan sebelum mengonfirmasi.` });
-        } catch {
+        } catch (error) {
           await refreshAIRequestCount(projectId);
-          setNotice({ kind: 'info', text: 'Tinjauan AI gagal. Kandidat dari pemindaian lokal tetap tersedia.' });
+          setNotice({ kind: 'info', text: `Tinjauan AI gagal (${getError(error)}). Kandidat dari pemindaian lokal tetap tersedia.` });
         }
         return;
       }
@@ -854,15 +861,16 @@ export default function App() {
           {selectedSource && !missingMediaPaths.includes(selectedSource.path) ? <>
             <p className="workflow-help">{workerState?.upstream?.kill_detection ? 'Cari kandidat kill, lalu putar cuplikannya dan cek kill feed sebelum mengonfirmasi.' : 'Putar rekaman, lalu tandai kill yang ingin kamu masukkan ke montage.'}</p>
             <div className="highlight-actions">
-              <button className="button primary" onClick={() => void detectKillCandidates(true)}
+              {workerState?.upstream?.kill_detection && <button className="button primary" onClick={() => void detectKillCandidates()} disabled={Boolean(busy)}>Cari kill otomatis</button>}
+              <button className="button subtle" onClick={() => void detectKillCandidates(true)}
                 disabled={Boolean(busy) || !workerState?.upstream?.kill_detection || !aiCanPlan || Boolean(aiState?.aiBusy) || aiUsageCount >= MAX_AI_REQUESTS_PER_PROJECT}>
-                Cari kill otomatis using AI Model
+                Pindai lokal + urutkan via AI (metadata)
               </button>
-              {!aiCanPlan && <p className="workflow-help">Hubungkan ChatGPT di Director untuk memakai tinjauan AI.</p>}
-              {aiCanPlan && aiUsageCount >= MAX_AI_REQUESTS_PER_PROJECT && <p className="workflow-help">Jatah AI proyek habis. Pencarian lokal tetap tersedia.</p>}
+              {!aiCanPlan && <p className="workflow-help">Opsional: hubungkan ChatGPT di Director untuk mengurutkan metadata kandidat lokal (video &amp; audio tetap di perangkat).</p>}
+              {aiCanPlan && aiUsageCount < MAX_AI_REQUESTS_PER_PROJECT && <p className="workflow-help">AI hanya mengurutkan skor metadata lokal, bukan mendeteksi video. Jatah AI proyek: {aiUsageCount}/{MAX_AI_REQUESTS_PER_PROJECT}.</p>}
+              {aiCanPlan && aiUsageCount >= MAX_AI_REQUESTS_PER_PROJECT && <p className="workflow-help">Jatah AI proyek habis ({aiUsageCount}/{MAX_AI_REQUESTS_PER_PROJECT}). Pencarian lokal tetap tersedia.</p>}
               {busy === 'AI sedang meninjau metadata kandidat' && <p className="workflow-help" role="status">AI sedang meninjau metadata kandidat.</p>}
               {busy === 'AI sedang meninjau metadata kandidat' && aiState?.aiBusy && <button className="button subtle" onClick={() => void cancelAIRequest()}>Batalkan tinjauan AI</button>}
-              {workerState?.upstream?.kill_detection && <button className="button primary" onClick={() => void detectKillCandidates()} disabled={Boolean(busy)}>Cari kill otomatis</button>}
               <button className="button subtle" aria-expanded={manualMarking} aria-controls={manualMarking ? 'manual-highlight' : undefined} onClick={() => {
                 if (!manualMarking) {
                   setPreviewRenderUrl('');

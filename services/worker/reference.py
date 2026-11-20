@@ -16,7 +16,7 @@ import uuid
 from .media import MediaToolError, app_data_dir, probe_audio, probe_media, publish_render, render_partial_path
 from .schema import validate_project
 from .upstream import (UPSTREAM_COMMIT, UPSTREAM_SCRIPTS, _count_video_frames,
-                       _run_upstream_cancellable, detect_kills, upstream_python)
+                       _run_upstream_cancellable, detect_kills, rife_unavailable_reason, upstream_python)
 
 
 def _write(path: Path, data: Any) -> None:
@@ -378,9 +378,10 @@ def create_reference_draft(project: dict) -> dict:
     music = project.get("music")
     if not music:
         raise MediaToolError("Impor lagu sebelum membuat draft upstream untuk beat sync.")
+    rife_issue = rife_unavailable_reason()
     python = upstream_python(require_rife=True)
-    if not python:
-        raise MediaToolError("Jalankan scripts/setup-upstream.ps1 untuk mengaktifkan upstream dan RIFE.")
+    if rife_issue or not python:
+        raise MediaToolError(rife_issue or "Jalankan scripts/setup-upstream.ps1 untuk mengaktifkan upstream dan RIFE.")
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         raise MediaToolError("FFmpeg dan FFprobe dibutuhkan untuk membuat draft upstream.")
     notices: list[str] = []
@@ -517,6 +518,9 @@ def reference_preflight(project: dict, output_path: str, rights: bool, ownership
         errors.append("Konfirmasi hak penggunaan musik.")
     if not ownership:
         errors.append("Konfirmasi bahwa semua highlight draft upstream sudah ditinjau dan diizinkan.")
+    rife_issue = rife_unavailable_reason()
+    if rife_issue:
+        errors.append(rife_issue)
     if (destination.suffix.lower() != ".mp4" or not destination.parent.is_dir()
             or not os.access(destination.parent, os.W_OK) or destination.exists()):
         errors.append("Pilih nama output MP4 baru di folder yang tersedia.")
@@ -539,10 +543,11 @@ def render_reference(project: dict, output_path: str, rights: bool, ownership: b
     if report["errors"]:
         raise MediaToolError(" ".join(report["errors"]))
     work, metadata, summary = _load_reference(project)
+    rife_issue = rife_unavailable_reason()
     python = upstream_python(require_rife=True)
     ffmpeg = shutil.which("ffmpeg")
-    if not python or not ffmpeg:
-        raise MediaToolError("Runtime upstream/RIFE dan FFmpeg diperlukan.")
+    if rife_issue or not python or not ffmpeg:
+        raise MediaToolError(rife_issue or "Runtime upstream/RIFE dan FFmpeg diperlukan.")
     destination = Path(report["output_path"])
     partial = render_partial_path(destination, partial_token)
 

@@ -176,6 +176,7 @@ class UpstreamDetectionTests(unittest.TestCase):
             model = root / "model"
             model.mkdir()
             (model / "flownet.bin").write_bytes(b"model")
+            (model / "flownet.param").write_bytes(b"param")
 
             def fake_stage(python: str, script: Path, args: list[str], cwd: Path, timeout: int,
                            cancel_event: object = None) -> str:
@@ -226,6 +227,7 @@ class UpstreamDetectionTests(unittest.TestCase):
             model = root / "model"
             model.mkdir()
             (model / "flownet.bin").write_bytes(b"model")
+            (model / "flownet.param").write_bytes(b"param")
             captured: list[list[str]] = []
 
             def fake_popen(args: list[str], **kwargs: object) -> Process:

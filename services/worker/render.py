@@ -16,7 +16,7 @@ from .media import MediaToolError, probe_audio, probe_media, publish_render, ren
 from .schema import PROFILE_DIMENSIONS, PROFILES, ProjectValidationError, frames_to_duration_us, validate_project
 from .quality import (_audit_beat_sync, _has_measured_attacks, find_near_duplicate_plays,
                       missing_default_editing_requirements, run_quality_control)
-from .upstream import render_rife_segment, UPSTREAM_COMMIT
+from .upstream import render_rife_segment, rife_unavailable_reason, UPSTREAM_COMMIT
 
 ProgressCallback = Callable[[float, str], None]
 
@@ -115,6 +115,18 @@ def preflight(project: dict[str, Any], output_path: str, rights_acknowledged: bo
     if missing_editing:
         errors.append("Profil Smooth/Clean multi-kill belum memenuhi minimum editing: "
                       + ", ".join(missing_editing) + ". Perbaiki timeline sebelum master render.")
+    if render_mode != "rough_preview":
+        has_forward_slowmo = any(
+            segment["speed_num"] < segment["speed_den"] and segment.get("direction", "forward") == "forward"
+            for clip in project["timeline"] for segment in clip.get("time_remap", [])
+        )
+        if has_forward_slowmo:
+            rife_issue = rife_unavailable_reason()
+            if rife_issue:
+                warnings.append(
+                    f"RIFE tidak tersedia untuk slow motion ({rife_issue}) "
+                    "Render akan memakai fallback FFmpeg timestamp-aware dan status QA akan ditandai needs_review."
+                )
     return {"errors": errors, "warnings": warnings, "duration_us": duration_us,
             "total_frames": total_frames, "fps": fps, "width": width, "height": height,
             "music_duration_us": music_duration_us, "output_path": str(destination)}
@@ -168,8 +180,10 @@ def render_montage(project: dict[str, Any], output_path: str, *, rights_acknowle
                 inputs.extend(["-i", asset["path"]])
                 input_count += 1
             elif not interpolation_warnings or not interpolation_warnings[-1].startswith(f"Clip {clip['clip_id']}:"):
+                rife_issue = rife_unavailable_reason()
+                reason = rife_issue or "source bukan CFR atau tidak dapat dinormalisasi untuk RIFE"
                 interpolation_warnings.append(
-                    f"Clip {clip['clip_id']}: source bukan CFR atau runtime/model RIFE tidak tersedia; memakai interpolasi FFmpeg timestamp-aware."
+                    f"Clip {clip['clip_id']}: {reason}; memakai interpolasi FFmpeg timestamp-aware."
                 )
     music = project.get("music")
     music_index: int | None = None
@@ -279,6 +293,7 @@ def render_montage(project: dict[str, Any], output_path: str, *, rights_acknowle
         }
         sidecar = destination.with_suffix(".project.json")
         qc = run_quality_control(str(partial), project)
+        qc["file"] = str(destination)
         if cancel_event.is_set():
             raise InterruptedError("Render dibatalkan pengguna.")
         qa_json = destination.with_suffix(".qa.json")
@@ -547,11 +562,27 @@ def _build_filter_graph(project: dict[str, Any], fps: int, clip_audio: list[bool
         blur = next((item for item in effects if item.get("type") == "motion_blur"), None)
         if blur and float(blur.get("strength", 0.0)) > 0:
             window = int(blur.get("window_frames", 3))
+            half = window // 2
             edge = float(blur.get("strength", 0.0))
             weights = f"{edge:.4f} 1 {edge:.4f}" if window == 3 else f"{edge * 0.5:.4f} {edge:.4f} 1 {edge:.4f} {edge * 0.5:.4f}"
             blur_intervals = [f"between(n,{max(0, frame - 3)},{frame + 8})" for frame in impact_frames]
             blur_enable = _or_expression(blur_intervals)
-            chain.append(f"tmix=frames={window}:weights='{weights}':enable='{blur_enable}'")
+            pre = f"{','.join(chain)}," if chain else ""
+            clip_frames = clip["duration_frames"]
+            # Center tmix with zero frame delay and passthrough outside the impact window so
+            # audio/beat alignment and clip entry frames never shift by (window - 1) frames.
+            graph.append(
+                f"{video}{pre}trim=end_frame={clip_frames},setpts=N/({fps}*TB),format=yuv420p,split=2[vbo{index}][vbs{index}]"
+            )
+            graph.append(
+                f"[vbs{index}]tpad=stop_mode=clone:stop={half},tmix=frames={window}:weights='{weights}',"
+                f"trim=start_frame={half}:end_frame={clip_frames + half},setpts=N/({fps}*TB)[vbb{index}]"
+            )
+            graph.append(
+                f"[vbo{index}][vbb{index}]blend=all_expr=B:enable='{blur_enable}',setpts=N/({fps}*TB)[vblur{index}]"
+            )
+            video = f"[vblur{index}]"
+            chain = []
 
         transition_in = next((item for item in clip.get("transitions", []) if item.get("enabled", True)), None) if enable_effects else None
         transition_out = next((item for item in project["timeline"][index + 1].get("transitions", [])
@@ -560,6 +591,10 @@ def _build_filter_graph(project: dict[str, Any], fps: int, clip_audio: list[bool
             transition_out = None
         in_frames = min(int((transition_in or {}).get("duration_frames", 0)), clip["duration_frames"] // 2)
         out_frames = min(int((transition_out or {}).get("duration_frames", 0)), clip["duration_frames"] // 2)
+        if chain and ((in_frames and index > 0) or (out_frames and index + 1 < len(project["timeline"]))):
+            # Temporal filters such as tmix can repeat PTS 0 for their warmup frames;
+            # normalize timestamps before fade so dip_to_black starts and ends on exact frames.
+            chain.append(f"setpts=N/({fps}*TB)")
         if in_frames and index > 0:
             chain.append(f"fade=t=in:st=0:d={in_frames / fps:.9f}")
         if out_frames and index + 1 < len(project["timeline"]):
@@ -567,8 +602,6 @@ def _build_filter_graph(project: dict[str, Any], fps: int, clip_audio: list[bool
         if chain:
             graph.append(f"{video}{','.join(chain)},trim=end_frame={clip['duration_frames']},setpts=N/({fps}*TB)[vclip{index}]")
             video = f"[vclip{index}]"
-        else:
-            video = video_base
         clip_video_labels.append(video)
         clip_audio_labels.append(audio_base)
 
@@ -580,7 +613,7 @@ def _build_filter_graph(project: dict[str, Any], fps: int, clip_audio: list[bool
             frequency = 72 if "multikill" in effective_tags or "clutch" in effective_tags else 88
             label = f"sfx{index}"
             graph.append(f"aevalsrc='0.30*sin(2*PI*({frequency}-130*t)*t)*exp(-15*t)':s=48000:d=0.28,"
-                         f"pan=stereo|c0=c0|c1=c0,volume={0.56 * intensity:.4f},adelay={hit_sample}S[{label}]")
+                         f"pan=stereo|c0=c0|c1=c0,volume={0.56 * intensity:.4f},adelay={hit_sample}S:all=1[{label}]")
             sfx_labels.append(f"[{label}]")
         output_offset_frames += clip["duration_frames"]
 

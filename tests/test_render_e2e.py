@@ -1,5 +1,7 @@
 """Real FFmpeg integration check; it skips with a reason if local binaries are absent."""
 
+import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -227,7 +229,140 @@ class RenderEndToEndTests(unittest.TestCase):
                              ["event-0", "event-grouped"])
             self.assertEqual(set(result["qa"]["render_manifest"]["effects_applied"][0]["impact_output_frames"]),
                              {"event-0", "event-grouped"})
+            self.assertEqual(result["qa"]["file"], str(output.resolve()))
+            self.assertEqual(json.loads(Path(result["qa_json"]).read_text(encoding="utf-8"))["file"],
+                             str(output.resolve()))
             self.assertTrue(progresses)
+
+    def test_motion_blur_with_dip_to_black_preserves_fade_timing_and_final_qa_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            src = root / "bright.mp4"
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=60",
+                            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "2",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(src)],
+                           capture_output=True, check=True, timeout=30)
+            project = new_project("Motion blur fade timing")
+            project["settings"].update(output_profile="youtube_60", beat_sync_priority=0, effects_intensity=0.45)
+            project["sources"] = [{"media_id": "media-fade", "path": str(src), "duration_us": 2_000_000,
+                                   "has_audio": True, "video": {"avg_frame_rate": [60, 1]}}]
+            project["events"] = [
+                {"event_id": "ev-1", "source_media_id": "media-fade", "source_time_us": 300_000, "source_frame": 18,
+                 "in_us": 100_000, "out_us": 600_000, "owner": "player", "confidence": 1, "tags": [],
+                 "evidence": [], "is_user_override": True},
+                {"event_id": "ev-2", "source_media_id": "media-fade", "source_time_us": 1_200_000, "source_frame": 72,
+                 "in_us": 1_000_000, "out_us": 1_500_000, "owner": "player", "confidence": 1, "tags": [],
+                 "evidence": [], "is_user_override": True},
+            ]
+            clip1 = add_timeline_clip(project, "ev-1")
+            clip2 = add_timeline_clip(project, "ev-2")
+            for clip in (clip1, clip2):
+                clip["effects"] = [
+                    {"type": "impact_zoom", "max_zoom": 1.03, "duration_frames": 12, "anchor": "impact", "enabled": True},
+                    {"type": "motion_blur", "strength": 0.15, "window_frames": 3, "enabled": True},
+                ]
+            clip2["transitions"] = [{"type": "dip_to_black", "duration_frames": 6, "enabled": True}]
+            normalize_timeline(project)
+            output = root / "blur-fade.mp4"
+            result = render_montage(project, str(output), rights_acknowledged=False, ownership_acknowledged=False,
+                                    cancel_event=threading.Event(), progress=lambda *_: None)
+            self.assertEqual(result["qa"]["file"], str(output.resolve()))
+            self.assertEqual(json.loads(Path(result["qa_json"]).read_text(encoding="utf-8"))["file"],
+                             str(output.resolve()))
+            self.assertEqual(result["qa"]["max_identical_frame_run"], 1)
+            # Clip 2 starts at frame 30 with a 6-frame fade-in; only frame 30 may be pure black (YAVG ~ 16).
+            probe = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-v", "error", "-i", str(output), "-map", "0:v:0",
+                 "-vf", "select=between(n\\,24\\,35),signalstats,metadata=print:file=-", "-an", "-f", "null", "-"],
+                capture_output=True, text=True, check=True, timeout=30)
+            yavgs = [float(value) for value in re.findall(r"lavfi\.signalstats\.YAVG=([0-9.]+)", probe.stdout)]
+            self.assertEqual(len(yavgs), 12)
+            # Clip 1 fade-out: frames 24..29 must decrease monotonically toward black
+            self.assertGreater(yavgs[0], yavgs[5] + 30)
+            # Clip 2 fade-in: frame 30 is black (~16), frame 31 must already brighten above black
+            self.assertLessEqual(yavgs[6], 18.0)
+            self.assertGreater(yavgs[7], 25.0)
+            self.assertGreater(yavgs[8], yavgs[7])
+
+    def test_motion_blur_does_not_shift_frames_outside_impact_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            src = root / "motion.mp4"
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=60,scroll=h=0.03",
+                            "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
+                           capture_output=True, check=True, timeout=30)
+            project = new_project("Zero shift blur")
+            project["settings"].update(output_profile="youtube_60", beat_sync_priority=0, effects_intensity=0)
+            project["sources"] = [{"media_id": "m-blur", "path": str(src), "duration_us": 1_000_000,
+                                   "has_audio": False, "video": {"avg_frame_rate": [60, 1]}}]
+            project["events"] = [{"event_id": "e-blur", "source_media_id": "m-blur", "source_time_us": 500_000,
+                                  "source_frame": 30, "in_us": 100_000, "out_us": 800_000,
+                                  "owner": "player", "confidence": 1, "tags": [], "evidence": [],
+                                  "is_user_override": True}]
+            add_timeline_clip(project, "e-blur")
+            base_mp4 = root / "base.mp4"
+            blur_mp4 = root / "blur.mp4"
+            render_montage(deepcopy(project), str(base_mp4), rights_acknowledged=False, ownership_acknowledged=False,
+                           cancel_event=threading.Event(), progress=lambda *_: None)
+            blurred = deepcopy(project)
+            blurred["settings"]["effects_intensity"] = 0.45
+            blurred["timeline"][0]["effects"] = [{"type": "motion_blur", "strength": 0.35, "window_frames": 3, "enabled": True}]
+            res = render_montage(blurred, str(blur_mp4), rights_acknowledged=False, ownership_acknowledged=False,
+                                 cancel_event=threading.Event(), progress=lambda *_: None)
+            self.assertEqual(res["qa"]["max_identical_frame_run"], 1)
+
+            def grab(path: Path, frame_idx: int) -> bytes:
+                return subprocess.check_output(
+                    ["ffmpeg", "-v", "error", "-i", str(path), "-vf",
+                     f"select=eq(n\\,{frame_idx}),scale=160:90,format=gray", "-frames:v", "1", "-f", "rawvideo", "-"],
+                    timeout=30)
+
+            def diff(a: bytes, b: bytes) -> float:
+                return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+            # Impact is at local frame 24 (blur active on frames 21..32).
+            # Early frame 5 must remain aligned with baseline (not shifted by 2 frames).
+            self.assertLess(diff(grab(blur_mp4, 5), grab(base_mp4, 5)), 0.5)
+            # Frame 24 inside blur window must differ measurably from baseline.
+            self.assertGreater(diff(grab(blur_mp4, 24), grab(base_mp4, 24)), 2.5)
+
+    def test_impact_sfx_delays_both_stereo_channels_to_impact_frame(self) -> None:
+        import array
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            src = root / "silent.mp4"
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=60",
+                            "-t", "1.5", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)],
+                           capture_output=True, check=True, timeout=30)
+            project = new_project("Stereo SFX delay")
+            project["settings"].update(output_profile="youtube_60", beat_sync_priority=0, effects_intensity=0.45)
+            project["sources"] = [{"media_id": "m-sfx", "path": str(src), "duration_us": 1_500_000,
+                                   "has_audio": False, "video": {"avg_frame_rate": [60, 1]}}]
+            project["events"] = [{"event_id": "e-sfx", "source_media_id": "m-sfx", "source_time_us": 500_000,
+                                  "source_frame": 30, "in_us": 0, "out_us": 1_200_000,
+                                  "owner": "player", "confidence": 1, "tags": [], "evidence": [],
+                                  "is_user_override": True}]
+            clip = add_timeline_clip(project, "e-sfx")
+            clip["effects"] = [{"type": "impact_zoom", "max_zoom": 1.03, "duration_frames": 12,
+                                "anchor": "impact", "enabled": True}]
+            normalize_timeline(project)
+            out_mp4 = root / "sfx.mp4"
+            render_montage(project, str(out_mp4), rights_acknowledged=False, ownership_acknowledged=False,
+                           cancel_event=threading.Event(), progress=lambda *_: None)
+            raw = subprocess.check_output(
+                ["ffmpeg", "-hide_banner", "-v", "error", "-i", str(out_mp4),
+                 "-map", "0:a:0", "-vn", "-ar", "48000", "-ac", "2", "-f", "s16le", "-"],
+                timeout=30)
+            samples = array.array("h")
+            samples.frombytes(raw[:len(raw) - len(raw) % 2])
+            for ch_idx in (0, 1):
+                channel = [abs(v) / 32768.0 for v in samples[ch_idx::2]]
+                peak = max(channel)
+                self.assertGreater(peak, 0.02)
+                onset_idx = next(i for i, v in enumerate(channel) if v >= peak * 0.1)
+                onset_ms = onset_idx * 1000.0 / 48000.0
+                self.assertGreaterEqual(onset_ms, 490.0)
+                self.assertLessEqual(onset_ms, 520.0)
 
 
 if __name__ == "__main__":

@@ -109,7 +109,9 @@ class ReferenceDraftTests(TestCase):
     def test_legacy_render_cannot_silently_replace_stale_reference_plan(self):
         project = new_project()
         project["reference_draft"] = "a" * 32
-        with TemporaryDirectory() as directory, patch.object(reference, "app_data_dir", return_value=Path(directory)):
+        with (TemporaryDirectory() as directory,
+              patch.object(reference, "app_data_dir", return_value=Path(directory)),
+              patch.object(reference, "rife_unavailable_reason", return_value=None)):
             root = Path(directory)
             draft = root / "reference-drafts" / project["reference_draft"]
             draft.mkdir(parents=True)
@@ -186,3 +188,54 @@ class NativeStyleTests(TestCase):
         self.assertEqual(entry_transition(11.0, True, "cut", 2), ("broll", 0.0, -1))
         self.assertEqual(entry_transition(11.0, False, "cut", 2), ("bwhip", 0.0, -1))
         self.assertEqual(entry_transition(6.4, False, "bwhip", 2), ("bwhip", 0.0, -1))
+
+    def test_missing_or_incomplete_rife_model_is_reported_before_draft_and_preflight(self):
+        from services.worker import render as manual_render, upstream
+        from services.worker.schema import add_timeline_clip, normalize_timeline
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            partial_model = root / "partial-model"
+            partial_model.mkdir()
+            (partial_model / "flownet.bin").write_bytes(b"incomplete")
+            empty_model = root / "empty-model"
+            empty_model.mkdir()
+
+            source = root / "clip.mp4"
+            source.write_bytes(b"fake")
+            music = root / "song.mp3"
+            music.write_bytes(b"fake")
+
+            project = new_project("Missing RIFE model")
+            project["settings"].update(output_profile="master_144", beat_sync_priority=0.0, effects_intensity=0.0)
+            project["sources"] = [{
+                "media_id": "m1", "path": str(source), "duration_us": 2_000_000, "has_audio": False,
+                "video": {"avg_frame_rate": [60, 1], "r_frame_rate": [60, 1]},
+            }]
+            project["events"] = [{
+                "event_id": "e1", "source_media_id": "m1", "source_time_us": 500_000, "source_frame": 30,
+                "in_us": 100_000, "out_us": 1_000_000, "owner": "player", "confidence": 1.0,
+                "tags": [], "evidence": [], "is_user_override": True,
+            }]
+            clip = add_timeline_clip(project, "e1")
+            clip["time_remap"] = [{
+                "source_start_us": 100_000, "source_end_us": 1_000_000,
+                "speed_num": 1, "speed_den": 2, "direction": "forward",
+            }]
+            normalize_timeline(project)
+            native_proj = new_project("Native missing model")
+            native_proj["music"] = {"path": str(music), "offset_us": 0}
+
+            for model_dir in (empty_model, partial_model):
+                with (patch.object(upstream, "UPSTREAM_MODEL", model_dir),
+                      patch.object(upstream, "upstream_python", return_value="fake-python"),
+                      patch.object(reference, "upstream_python", return_value="fake-python")):
+                    self.assertFalse(upstream.rife_model_ready())
+                    self.assertIn("flownet.bin", upstream.rife_unavailable_reason() or "")
+                    self.assertIsNone(upstream.render_rife_segment(project["sources"][0], clip["time_remap"][0], 144, 100))
+                    with self.assertRaisesRegex(reference.MediaToolError, "Model RIFE"):
+                        reference.create_reference_draft(native_proj)
+                    pf_master = manual_render.preflight(project, str(root / "out.mp4"), False, True, render_mode="master")
+                    self.assertTrue(any("Model RIFE" in w for w in pf_master["warnings"]))
+                    pf_rough = manual_render.preflight(project, str(root / "out.mp4"), False, True, render_mode="rough_preview")
+                    self.assertFalse(any("RIFE" in w for w in pf_rough["warnings"]))

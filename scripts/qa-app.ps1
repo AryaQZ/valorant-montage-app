@@ -7,6 +7,18 @@ param(
     [switch]$TestKillReview
 )
 $ErrorActionPreference = 'Stop'
+function Invoke-Logged {
+    param([scriptblock]$Command, [string]$LogPath, [string]$FailureMessage)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Command *> $LogPath
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    if ($code -ne 0) { throw "$FailureMessage See $LogPath." }
+}
 $repo = Split-Path $PSScriptRoot
 $desktop = Join-Path $repo 'apps/desktop'
 $game = (Resolve-Path -LiteralPath $Gameplay).Path
@@ -25,19 +37,17 @@ if (!$env:VMS_UPSTREAM_PYTHON -and (Test-Path -LiteralPath $upstreamPython)) { $
 $before = Get-FileHash -LiteralPath @($game, $song)
 Push-Location $desktop
 try {
-    & npm.cmd run build *> "$root/build.log"
-    if ($LASTEXITCODE -ne 0) { throw "Build failed. See $root/build.log." }
-    & (Join-Path $repo 'scripts/test.ps1') *> "$root/tests.log"
+    Invoke-Logged { & npm.cmd run build } "$root/build.log" 'Build failed.'
+    Invoke-Logged { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts/test.ps1') } "$root/tests.log" 'Tests failed.'
     Set-Location -LiteralPath $desktop
-    & .\node_modules\.bin\electron-builder.cmd --win nsis --x64 '-c.electronDist=./node_modules/electron/dist' "-c.directories.output=$root/release" *> "$root/package.log"
-    if ($LASTEXITCODE -ne 0) { throw "Packaging failed. See $root/package.log." }
+    Invoke-Logged { & .\node_modules\.bin\electron-builder.cmd --win nsis --x64 '-c.electronDist=./node_modules/electron/dist' "-c.directories.output=$root/release" } "$root/package.log" 'Packaging failed.'
     & node (Join-Path $PSScriptRoot 'qa-app.mjs') stage
     if ($LASTEXITCODE -ne 0) { throw 'QA staging failed.' }
     $p = Start-Process -FilePath "$desktop/node_modules/electron/dist/electron.exe" -ArgumentList ('"' + "$root/tested" + '"') -WorkingDirectory $repo -WindowStyle Hidden -PassThru -RedirectStandardOutput "$root/electron-out.log" -RedirectStandardError "$root/electron-err.log"
     if (!$p.WaitForExit(600000)) { Stop-Process -Id $p.Id; throw 'QA exceeded the UI test timeout.' }
     $after = Get-FileHash -LiteralPath @($game, $song)
     if (Compare-Object $before $after -Property Path,Hash) { throw 'Source hash changed during testing.' }
-    $before | ConvertTo-Json | Set-Content -Encoding utf8NoBOM "$root/input-hashes.json"
+    [IO.File]::WriteAllText("$root/input-hashes.json", ($before | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
     $outcome = Get-Content -LiteralPath "$root/ui-evidence.json" -Raw | ConvertFrom-Json
     if (!$outcome.finished) { throw "UI checks failed. See $root/ui-evidence.json." }
     $env:VMS_AUDIT_RESTART_CHECK = '1'
@@ -57,6 +67,7 @@ try {
             Set-Item -Path $setting -Value $(if ($crashMode) { $crashMode } else { '1' })
             try {
                 $p = Start-Process -FilePath "$desktop/node_modules/electron/dist/electron.exe" -ArgumentList ('"' + "$root/tested" + '"') -WorkingDirectory $repo -WindowStyle Hidden -PassThru -RedirectStandardOutput "$root/$phase-out.log" -RedirectStandardError "$root/$phase-err.log"
+                $null = $p.Handle
                 if (!$p.WaitForExit(180000)) { Stop-Process -Id $p.Id; throw "$phase exceeded its timeout." }
                 if ($crashMode) {
                     $crash = Get-Content -LiteralPath "$root/crash-$crashMode-evidence.json" -Raw | ConvertFrom-Json
@@ -116,8 +127,7 @@ try {
     if ($ReviewedProject) {
         $reviewedPath = (Resolve-Path -LiteralPath $ReviewedProject).Path
         $env:PYTHONPATH = $repo
-        & python -u (Join-Path $PSScriptRoot 'qa-native.py') --project $reviewedPath --output "$root/native" *> "$root/native.log"
-        if ($LASTEXITCODE -ne 0) { throw "Native QA failed. See $root/native.log." }
+        Invoke-Logged { & python -u (Join-Path $PSScriptRoot 'qa-native.py') --project $reviewedPath --output "$root/native" } "$root/native.log" 'Native QA failed.'
     }
     Write-Output "Regression and packaged-renderer evidence: $root"
 } finally {

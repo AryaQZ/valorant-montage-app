@@ -1,6 +1,6 @@
 {
   "name": "valorant-montage-studio",
-  "version": "0.1.11-qa.4",
+  "version": "0.1.11-rc.1",
   "author": "VALORANT Montage Studio contributors",
   "private": true,
   "description": "Local-first VALORANT montage editor with optional ChatGPT subscription planning",
@@ -17,7 +17,7 @@
     "typecheck": "tsc --noEmit",
     "build": "npm run build:siwc && npm run typecheck && electron-vite build",
     "preview": "electron-vite preview",
-    "test": "vitest run shared/director.test.ts shared/kill-review.test.ts electron/worker-client.test.ts",
+    "test": "vitest run shared/director.test.ts shared/kill-review.test.ts shared/shortcuts.test.ts electron/worker-client.test.ts",
     "package:win": "npm run build && electron-builder --win nsis"
   },
   "dependencies": {

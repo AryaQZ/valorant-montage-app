@@ -87,10 +87,26 @@ def upstream_python(*, require_rife: bool = False) -> str | None:
     return None
 
 
+def rife_model_ready(model_dir: Path | None = None) -> bool:
+    target = model_dir or UPSTREAM_MODEL
+    return (target / "flownet.bin").is_file() and (target / "flownet.param").is_file()
+
+
+def rife_unavailable_reason() -> str | None:
+    if not UPSTREAM_SCRIPTS.is_dir():
+        return "Skrip upstream RIFE tidak ditemukan."
+    if not upstream_python(require_rife=True):
+        return "Runtime Python 3.11 dengan rife-ncnn-vulkan belum tersedia. Jalankan scripts/setup-upstream.ps1."
+    if not rife_model_ready():
+        return (f"Model RIFE v4.25 tidak lengkap atau tidak ditemukan (butuh flownet.bin dan flownet.param di "
+                f"{UPSTREAM_MODEL}). Jalankan scripts/setup-upstream.ps1.")
+    return None
+
+
 def capabilities() -> dict[str, Any]:
     python = upstream_python()
     rife_python = upstream_python(require_rife=True) if python else None
-    model_ok = (UPSTREAM_MODEL / "flownet.bin").is_file() and (UPSTREAM_MODEL / "flownet.param").is_file()
+    model_ok = rife_model_ready()
     return {
         "repository": "https://github.com/gustavomenani/editing-gameplay-montages",
         "commit": UPSTREAM_COMMIT,
@@ -189,7 +205,7 @@ def _stop_upstream_process(process: subprocess.Popen) -> None:
 def _normalize_vfr_source(source_path: Path, source_digest: str, *, cancel_event: Any = None) -> tuple[Path, int, str] | None:
     """Use upstream's timestamp-aware exact ingest to create a frame-indexed 60 fps working copy."""
     python = upstream_python(require_rife=True)
-    if not python or not (UPSTREAM_MODEL / "flownet.bin").is_file():
+    if not python or not rife_model_ready():
         return None
     identity = hashlib.sha256(json.dumps({"source_sha256": source_digest, "mode": "exact",
                                           "fps": 60, "upstream_commit": UPSTREAM_COMMIT},
@@ -440,7 +456,7 @@ def render_rife_segment(source: dict[str, Any], segment: dict[str, Any], fps: in
         return None
     behavior = source.get("video", {}).get("timestamp_behavior") or {}
     python = upstream_python(require_rife=True)
-    if not python or not (UPSTREAM_MODEL / "flownet.bin").is_file():
+    if not python or not rife_model_ready():
         return None
     original_path = Path(source["path"]).resolve(strict=True)
     source_digest = _sha256_file(original_path)
